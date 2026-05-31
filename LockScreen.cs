@@ -1,0 +1,1830 @@
+// =============================================================================
+//  KeyMouseLock — 鍵鼠鎖定工具
+//  依 DESIGN.md v1.0 實作。C# + WinForms，目標 .NET Framework 4.x。
+//  以 Windows 內建 csc.exe 編譯為單一 exe（見 build.bat）。
+//
+//  安全邊界：本工具屬使用者層級，「防隨手亂動」而非「防內行破解」。
+//  Ctrl+Alt+Del 仍可進入安全桌面結束本程式——此為無核心驅動之先天限制。
+// =============================================================================
+
+using System;
+using System.Collections.Generic;
+using System.Drawing;
+using System.Drawing.Drawing2D;
+using System.Drawing.Imaging;
+using System.Drawing.Text;
+using System.Globalization;
+using System.IO;
+using System.Net;
+using System.Runtime.InteropServices;
+using System.Security.Cryptography;
+using System.Text;
+using System.Threading;
+using System.Web.Script.Serialization;   // System.Web.Extensions.dll
+using System.Windows.Forms;
+
+namespace KeyMouseLock
+{
+    // =========================================================================
+    //  密碼策略（第 7 節，公開友善版）
+    //  - 原始碼「不含任何機密」：無預設主密碼、無寫死緊急碼。
+    //  - 主密碼：必設。首次於設定介面建立，以 PBKDF2 雜湊存入各機自己的 config.json。
+    //  - 救援碼：使用者自選是否設定，同樣以雜湊存入 config.json。
+    //  - 主密碼或救援碼（若有設）皆可解鎖。機密只存在各機本地，雲端原始碼一概沒有。
+    // =========================================================================
+
+    // 設定檔中的密碼欄位（僅存雜湊與鹽，不存明碼）。
+    internal sealed class PasswordConfig
+    {
+        public string hash;        // base64(PBKDF2)
+        public string salt;        // base64
+        public int iterations = 100000;
+    }
+
+    // PBKDF2 密碼雜湊與驗證。
+    internal static class PasswordManager
+    {
+        // 是否已設定主密碼（未設定則不允許鎖定，避免把自己鎖死）。
+        public static bool HasMaster(AppConfig cfg)
+        {
+            return cfg != null && cfg.password != null
+                && !string.IsNullOrEmpty(cfg.password.hash) && !string.IsNullOrEmpty(cfg.password.salt);
+        }
+
+        public static void SetPassword(AppConfig cfg, string newPassword)
+        {
+            cfg.password = Make(newPassword);
+        }
+
+        // 設定 / 清除救援碼（傳空字串視為清除）。
+        public static void SetRescue(AppConfig cfg, string rescuePassword)
+        {
+            cfg.rescue = string.IsNullOrEmpty(rescuePassword) ? null : Make(rescuePassword);
+        }
+
+        public static bool HasRescue(AppConfig cfg)
+        {
+            return cfg != null && cfg.rescue != null
+                && !string.IsNullOrEmpty(cfg.rescue.hash) && !string.IsNullOrEmpty(cfg.rescue.salt);
+        }
+
+        // 主密碼或救援碼任一相符即通過。無內建後門。
+        public static bool Verify(AppConfig cfg, string input)
+        {
+            if (input == null || cfg == null) return false;
+            if (VerifyAgainst(cfg.password, input)) return true;
+            if (VerifyAgainst(cfg.rescue, input)) return true;
+            return false;
+        }
+
+        private static bool VerifyAgainst(PasswordConfig pc, string input)
+        {
+            if (pc == null || string.IsNullOrEmpty(pc.hash) || string.IsNullOrEmpty(pc.salt)) return false;
+            try
+            {
+                byte[] salt = Convert.FromBase64String(pc.salt);
+                byte[] expected = Convert.FromBase64String(pc.hash);
+                byte[] actual = Derive(input, salt, pc.iterations <= 0 ? 100000 : pc.iterations);
+                return FixedTimeEquals(expected, actual);
+            }
+            catch { return false; }
+        }
+
+        private static PasswordConfig Make(string password)
+        {
+            byte[] salt = new byte[16];
+            using (var rng = new RNGCryptoServiceProvider()) rng.GetBytes(salt);
+            int iter = 100000;
+            byte[] hash = Derive(password, salt, iter);
+            return new PasswordConfig
+            {
+                salt = Convert.ToBase64String(salt),
+                hash = Convert.ToBase64String(hash),
+                iterations = iter
+            };
+        }
+
+        private static byte[] Derive(string password, byte[] salt, int iterations)
+        {
+            using (var pbkdf2 = new Rfc2898DeriveBytes(password ?? "", salt, iterations))
+                return pbkdf2.GetBytes(32);
+        }
+
+        private static bool FixedTimeEquals(byte[] a, byte[] b)
+        {
+            if (a == null || b == null || a.Length != b.Length) return false;
+            int diff = 0;
+            for (int i = 0; i < a.Length; i++) diff |= a[i] ^ b[i];
+            return diff == 0;
+        }
+    }
+
+    // =========================================================================
+    //  設定模型（config.json）
+    // =========================================================================
+    internal sealed class BackgroundConfig
+    {
+        public string type = "blurDesktop";   // blurDesktop | image | solidDark
+        public int blur = 18;                  // 模糊強度
+        public double dim = 0.25;              // 變暗程度 0~1
+        public string path = null;             // type=image 時的圖片路徑
+    }
+
+    internal sealed class WidgetConfig
+    {
+        public string type;                    // clock | date | text | hint | weather
+        public string format;
+        public string content;
+        public string city;
+        public string y = "50%";               // 垂直位置（百分比或像素）
+        public int fontSize = 20;
+        public bool enabled = true;
+    }
+
+    internal sealed class AppConfig
+    {
+        public BackgroundConfig background = new BackgroundConfig();
+        public int idleTimeoutSec = 10;
+        public string hotkey = "Ctrl+Alt+L";      // 全域鎖定快捷鍵
+        public bool showClock = true;             // 鎖屏是否顯示內建時鐘
+        public List<WidgetConfig> widgets = new List<WidgetConfig>();
+        public PasswordConfig password = null;   // 主密碼雜湊（由 UI 設定）
+        public PasswordConfig rescue = null;     // 救援碼雜湊（可選，由 UI 設定）
+
+        public static AppConfig LoadOrDefault(string path)
+        {
+            try
+            {
+                if (!File.Exists(path)) return Default();
+                string json = File.ReadAllText(path, Encoding.UTF8);
+                var ser = new JavaScriptSerializer();
+                var root = ser.Deserialize<Dictionary<string, object>>(json);
+                return FromDict(root);
+            }
+            catch
+            {
+                // 設定壞了不應使程式無法鎖定——退回安全預設。
+                return Default();
+            }
+        }
+
+        private static AppConfig FromDict(Dictionary<string, object> root)
+        {
+            var cfg = new AppConfig();
+
+            if (root.ContainsKey("background") && root["background"] is Dictionary<string, object>)
+            {
+                var b = (Dictionary<string, object>)root["background"];
+                cfg.background.type = GetStr(b, "type", cfg.background.type);
+                cfg.background.blur = GetInt(b, "blur", cfg.background.blur);
+                cfg.background.dim = GetDouble(b, "dim", cfg.background.dim);
+                cfg.background.path = GetStr(b, "path", null);
+            }
+
+            cfg.idleTimeoutSec = GetInt(root, "idleTimeoutSec", cfg.idleTimeoutSec);
+            cfg.hotkey = GetStr(root, "hotkey", cfg.hotkey);
+            cfg.showClock = GetBool(root, "showClock", cfg.showClock);
+
+            cfg.password = ReadPwd(root, "password");
+            cfg.rescue = ReadPwd(root, "rescue");
+
+            cfg.widgets.Clear();
+            if (root.ContainsKey("widgets") && root["widgets"] is System.Collections.IEnumerable)
+            {
+                foreach (var item in (System.Collections.IEnumerable)root["widgets"])
+                {
+                    var w = item as Dictionary<string, object>;
+                    if (w == null) continue;
+                    var wc = new WidgetConfig();
+                    wc.type = GetStr(w, "type", null);
+                    wc.format = GetStr(w, "format", null);
+                    wc.content = GetStr(w, "content", null);
+                    wc.city = GetStr(w, "city", null);
+                    wc.y = GetStr(w, "y", "50%");
+                    wc.fontSize = GetInt(w, "fontSize", 20);
+                    wc.enabled = GetBool(w, "enabled", true);
+                    if (!string.IsNullOrEmpty(wc.type)) cfg.widgets.Add(wc);
+                }
+            }
+            return cfg;
+        }
+
+        public static AppConfig Default()
+        {
+            // 預設：顯示內建時鐘即可（不再使用自訂 widget 清單）。
+            return new AppConfig();
+        }
+
+        // 手寫輸出整齊 JSON，並保留密碼雜湊區塊。
+        public void Save(string path)
+        {
+            var sb = new StringBuilder();
+            sb.AppendLine("{");
+            sb.AppendLine("  \"background\": { \"type\": " + JStr(background.type) +
+                          ", \"blur\": " + background.blur +
+                          ", \"dim\": " + background.dim.ToString(CultureInfo.InvariantCulture) +
+                          (string.IsNullOrEmpty(background.path) ? "" : ", \"path\": " + JStr(background.path)) +
+                          " },");
+            sb.AppendLine("  \"idleTimeoutSec\": " + idleTimeoutSec + ",");
+            sb.AppendLine("  \"hotkey\": " + JStr(hotkey) + ",");
+            var pwdLines = new List<string>();
+            if (password != null && !string.IsNullOrEmpty(password.hash)) pwdLines.Add(PwdJson("password", password));
+            if (rescue != null && !string.IsNullOrEmpty(rescue.hash)) pwdLines.Add(PwdJson("rescue", rescue));
+
+            sb.AppendLine("  \"showClock\": " + (showClock ? "true" : "false") + (pwdLines.Count > 0 ? "," : ""));
+            for (int i = 0; i < pwdLines.Count; i++)
+                sb.AppendLine("  " + pwdLines[i] + (i < pwdLines.Count - 1 ? "," : ""));
+
+            sb.AppendLine("}");
+
+            File.WriteAllText(path, sb.ToString(), new UTF8Encoding(false));
+        }
+
+        private static string PwdJson(string key, PasswordConfig pc)
+        {
+            return "\"" + key + "\": { \"hash\": " + JStr(pc.hash) +
+                   ", \"salt\": " + JStr(pc.salt) +
+                   ", \"iterations\": " + pc.iterations + " }";
+        }
+
+        private static string JStr(string s)
+        {
+            if (s == null) return "null";
+            var sb = new StringBuilder("\"");
+            foreach (char c in s)
+            {
+                switch (c)
+                {
+                    case '\"': sb.Append("\\\""); break;
+                    case '\\': sb.Append("\\\\"); break;
+                    case '\n': sb.Append("\\n"); break;
+                    case '\r': sb.Append("\\r"); break;
+                    case '\t': sb.Append("\\t"); break;
+                    default: sb.Append(c); break;
+                }
+            }
+            sb.Append("\"");
+            return sb.ToString();
+        }
+
+        private static PasswordConfig ReadPwd(Dictionary<string, object> root, string key)
+        {
+            if (!root.ContainsKey(key) || !(root[key] is Dictionary<string, object>)) return null;
+            var p = (Dictionary<string, object>)root[key];
+            return new PasswordConfig
+            {
+                hash = GetStr(p, "hash", null),
+                salt = GetStr(p, "salt", null),
+                iterations = GetInt(p, "iterations", 100000)
+            };
+        }
+
+        private static string GetStr(Dictionary<string, object> d, string k, string def)
+        {
+            object v; return d.TryGetValue(k, out v) && v != null ? v.ToString() : def;
+        }
+        private static int GetInt(Dictionary<string, object> d, string k, int def)
+        {
+            object v; if (!d.TryGetValue(k, out v) || v == null) return def;
+            int r; return int.TryParse(v.ToString(), NumberStyles.Any, CultureInfo.InvariantCulture, out r) ? r : def;
+        }
+        private static double GetDouble(Dictionary<string, object> d, string k, double def)
+        {
+            object v; if (!d.TryGetValue(k, out v) || v == null) return def;
+            double r; return double.TryParse(v.ToString(), NumberStyles.Any, CultureInfo.InvariantCulture, out r) ? r : def;
+        }
+        private static bool GetBool(Dictionary<string, object> d, string k, bool def)
+        {
+            object v; if (!d.TryGetValue(k, out v) || v == null) return def;
+            bool r; return bool.TryParse(v.ToString(), out r) ? r : def;
+        }
+    }
+
+    // =========================================================================
+    //  Widget 架構（第 6 節）—— 工廠 / 策略模式，符合開放封閉原則。
+    // =========================================================================
+    internal interface IWidget
+    {
+        // screen：本元件可用的版面矩形（以表單座標表示，通常為主螢幕區域）。
+        void Render(Graphics g, Rectangle screen);
+    }
+
+    internal abstract class TextWidgetBase : IWidget
+    {
+        protected readonly WidgetConfig Cfg;
+        protected TextWidgetBase(WidgetConfig cfg) { Cfg = cfg; }
+
+        protected abstract string GetText();
+
+        protected virtual Color TextColor { get { return Color.White; } }
+
+        public void Render(Graphics g, Rectangle screen)
+        {
+            string text = GetText();
+            if (string.IsNullOrEmpty(text)) return;
+
+            int y = ResolveY(Cfg.y, screen);
+            using (var font = new Font("Segoe UI", Cfg.fontSize, FontStyle.Regular, GraphicsUnit.Pixel))
+            using (var brush = new SolidBrush(TextColor))
+            using (var shadow = new SolidBrush(Color.FromArgb(160, 0, 0, 0)))
+            using (var fmt = new StringFormat { Alignment = StringAlignment.Center, LineAlignment = StringAlignment.Center })
+            {
+                var rect = new RectangleF(screen.Left, y, screen.Width, Cfg.fontSize * 1.6f);
+                // 陰影提升於各種背景上的可讀性
+                g.DrawString(text, font, shadow, new RectangleF(rect.X + 2, rect.Y + 2, rect.Width, rect.Height), fmt);
+                g.DrawString(text, font, brush, rect, fmt);
+            }
+        }
+
+        // 支援 "30%"（佔螢幕高比例）或 "120"（像素）
+        protected static int ResolveY(string y, Rectangle screen)
+        {
+            if (string.IsNullOrEmpty(y)) return screen.Top + screen.Height / 2;
+            y = y.Trim();
+            if (y.EndsWith("%"))
+            {
+                double pct;
+                if (double.TryParse(y.Substring(0, y.Length - 1), NumberStyles.Any, CultureInfo.InvariantCulture, out pct))
+                    return screen.Top + (int)(screen.Height * pct / 100.0);
+            }
+            int px;
+            if (int.TryParse(y, NumberStyles.Any, CultureInfo.InvariantCulture, out px))
+                return screen.Top + px;
+            return screen.Top + screen.Height / 2;
+        }
+    }
+
+    internal sealed class ClockWidget : TextWidgetBase
+    {
+        public ClockWidget(WidgetConfig c) : base(c) { }
+        protected override string GetText()
+        {
+            string f = string.IsNullOrEmpty(Cfg.format) ? "HH:mm" : Cfg.format;
+            return DateTime.Now.ToString(f, CultureInfo.CurrentCulture);
+        }
+    }
+
+    internal sealed class DateWidget : TextWidgetBase
+    {
+        public DateWidget(WidgetConfig c) : base(c) { }
+        protected override string GetText()
+        {
+            string f = string.IsNullOrEmpty(Cfg.format) ? "yyyy/MM/dd dddd" : Cfg.format;
+            return DateTime.Now.ToString(f, CultureInfo.CurrentCulture);
+        }
+    }
+
+    internal sealed class TextWidget : TextWidgetBase
+    {
+        public TextWidget(WidgetConfig c) : base(c) { }
+        protected override string GetText() { return Cfg.content; }
+    }
+
+    internal sealed class HintWidget : TextWidgetBase
+    {
+        public HintWidget(WidgetConfig c) : base(c) { }
+        protected override Color TextColor { get { return Color.FromArgb(200, 220, 220, 220); } }
+        protected override string GetText()
+        {
+            return string.IsNullOrEmpty(Cfg.content) ? "按任意鍵或點擊以解鎖" : Cfg.content;
+        }
+    }
+
+    // 天氣元件（第 6 節：預留，預設關閉）。會送出城市名至 wttr.in，故由老爺自行啟用。
+    internal sealed class WeatherWidget : TextWidgetBase
+    {
+        private string _cache = "…";
+        private bool _fetching;
+        public WeatherWidget(WidgetConfig c) : base(c) { BeginFetch(); }
+
+        protected override Color TextColor { get { return Color.FromArgb(230, 200, 230, 255); } }
+
+        private void BeginFetch()
+        {
+            if (_fetching || string.IsNullOrEmpty(Cfg.city)) return;
+            _fetching = true;
+            var t = new Thread(() =>
+            {
+                try
+                {
+                    ServicePointManager.SecurityProtocol = (SecurityProtocolType)3072; // TLS1.2
+                    using (var wc = new WebClient())
+                    {
+                        wc.Encoding = Encoding.UTF8;
+                        // 格式：城市 +溫度，例：Taipei: 26°C
+                        string url = "https://wttr.in/" + Uri.EscapeDataString(Cfg.city) + "?format=%l:+%t";
+                        _cache = wc.DownloadString(url).Trim();
+                    }
+                }
+                catch { _cache = Cfg.city + ": —"; }
+            });
+            t.IsBackground = true;
+            t.Start();
+        }
+
+        protected override string GetText() { return _cache; }
+    }
+
+    internal static class WidgetFactory
+    {
+        public static IWidget Create(WidgetConfig cfg)
+        {
+            if (cfg == null || !cfg.enabled) return null;
+            switch ((cfg.type ?? "").ToLowerInvariant())
+            {
+                case "clock": return new ClockWidget(cfg);
+                case "date": return new DateWidget(cfg);
+                case "text": return new TextWidget(cfg);
+                case "hint": return new HintWidget(cfg);
+                case "weather": return new WeatherWidget(cfg);
+                default: return null;   // 未知類型直接忽略
+            }
+        }
+    }
+
+    // 內建時鐘繪製：字級依畫面高度自動縮放，置於畫面中央偏上。
+    internal static class ClockRenderer
+    {
+        public static void Draw(Graphics g, Rectangle screen)
+        {
+            int fontSize = Math.Max(28, (int)(screen.Height * 0.09));
+            var cfg = new WidgetConfig { type = "clock", format = "HH:mm", y = "38%", fontSize = fontSize, enabled = true };
+            new ClockWidget(cfg).Render(g, screen);
+        }
+    }
+
+    // =========================================================================
+    //  背景層（第 5 節）
+    // =========================================================================
+    internal static class BackgroundFactory
+    {
+        public static Bitmap Build(BackgroundConfig cfg, Rectangle virtualScreen)
+        {
+            switch ((cfg.type ?? "").ToLowerInvariant())
+            {
+                case "image": return BuildImage(cfg, virtualScreen);
+                case "soliddark": return BuildSolid(virtualScreen);
+                case "blurdesktop":
+                default: return BuildBlurDesktop(cfg, virtualScreen);
+            }
+        }
+
+        private static Bitmap BuildSolid(Rectangle vs)
+        {
+            var bmp = new Bitmap(vs.Width, vs.Height, PixelFormat.Format32bppPArgb);
+            using (var g = Graphics.FromImage(bmp))
+                g.Clear(Color.FromArgb(18, 18, 20));
+            return bmp;
+        }
+
+        private static Bitmap BuildImage(BackgroundConfig cfg, Rectangle vs)
+        {
+            try
+            {
+                if (string.IsNullOrEmpty(cfg.path) || !File.Exists(cfg.path)) return BuildSolid(vs);
+                var bmp = new Bitmap(vs.Width, vs.Height, PixelFormat.Format32bppPArgb);
+                using (var src = new Bitmap(cfg.path))
+                using (var g = Graphics.FromImage(bmp))
+                {
+                    g.InterpolationMode = InterpolationMode.HighQualityBicubic;
+                    // 等比填滿（cover）
+                    double sx = (double)vs.Width / src.Width;
+                    double sy = (double)vs.Height / src.Height;
+                    double s = Math.Max(sx, sy);
+                    int w = (int)(src.Width * s), h = (int)(src.Height * s);
+                    int x = (vs.Width - w) / 2, y = (vs.Height - h) / 2;
+                    g.DrawImage(src, x, y, w, h);
+                }
+                if (cfg.blur > 0) ImageBlur.GaussianApprox(bmp, cfg.blur);
+                ApplyDim(bmp, cfg.dim);
+                return bmp;
+            }
+            catch { return BuildSolid(vs); }
+        }
+
+        // blurDesktop：擷取桌面 → 縮小 → 模糊 → 放大繪製 + 輕微變暗（第 5 節）
+        private static Bitmap BuildBlurDesktop(BackgroundConfig cfg, Rectangle vs)
+        {
+            try
+            {
+                using (var shot = new Bitmap(vs.Width, vs.Height, PixelFormat.Format32bppPArgb))
+                {
+                    using (var g = Graphics.FromImage(shot))
+                        g.CopyFromScreen(vs.Left, vs.Top, 0, 0, new Size(vs.Width, vs.Height), CopyPixelOperation.SourceCopy);
+
+                    // 縮至約 1/4（比 1/8 保留更多細節，模糊後仍看得出桌面輪廓）
+                    int sw = Math.Max(1, vs.Width / 4);
+                    int sh = Math.Max(1, vs.Height / 4);
+                    using (var small = new Bitmap(sw, sh, PixelFormat.Format32bppPArgb))
+                    {
+                        using (var g = Graphics.FromImage(small))
+                        {
+                            g.InterpolationMode = InterpolationMode.HighQualityBilinear;
+                            g.DrawImage(shot, 0, 0, sw, sh);
+                        }
+                        // 在小圖上模糊（半徑依設定縮放；小圖已是 1/4，故半徑收斂）
+                        int r = Math.Max(1, cfg.blur / 6);
+                        ImageBlur.GaussianApprox(small, r);
+
+                        // 放大回原尺寸（雙線性）
+                        var result = new Bitmap(vs.Width, vs.Height, PixelFormat.Format32bppPArgb);
+                        using (var g = Graphics.FromImage(result))
+                        {
+                            g.InterpolationMode = InterpolationMode.HighQualityBilinear;
+                            g.DrawImage(small, 0, 0, vs.Width, vs.Height);
+                        }
+                        ApplyDim(result, cfg.dim);
+                        return result;
+                    }
+                }
+            }
+            catch { return BuildSolid(vs); }
+        }
+
+        private static void ApplyDim(Bitmap bmp, double dim)
+        {
+            if (dim <= 0) return;
+            if (dim > 1) dim = 1;
+            using (var g = Graphics.FromImage(bmp))
+            using (var brush = new SolidBrush(Color.FromArgb((int)(dim * 255), 0, 0, 0)))
+                g.FillRectangle(brush, 0, 0, bmp.Width, bmp.Height);
+        }
+    }
+
+    // 三通道箱型模糊多趟近似高斯（第 5 節模糊備註）。在縮圖上運算，效能足夠。
+    internal static class ImageBlur
+    {
+        public static void GaussianApprox(Bitmap bmp, int radius)
+        {
+            if (radius < 1) return;
+            // 兩趟箱型模糊近似高斯（趟數越多越糊，兩趟在「保留輪廓」與「防偷看」間較平衡）
+            BoxBlur(bmp, radius);
+            BoxBlur(bmp, radius);
+        }
+
+        private static void BoxBlur(Bitmap bmp, int radius)
+        {
+            int w = bmp.Width, h = bmp.Height;
+            var rect = new Rectangle(0, 0, w, h);
+            var data = bmp.LockBits(rect, ImageLockMode.ReadWrite, PixelFormat.Format32bppArgb);
+            int stride = data.Stride;
+            int bytes = stride * h;
+            byte[] src = new byte[bytes];
+            byte[] dst = new byte[bytes];
+            Marshal.Copy(data.Scan0, src, 0, bytes);
+
+            // 水平
+            HorizontalBlur(src, dst, w, h, stride, radius);
+            // 垂直（dst→src 重用）
+            VerticalBlur(dst, src, w, h, stride, radius);
+
+            Marshal.Copy(src, 0, data.Scan0, bytes);
+            bmp.UnlockBits(data);
+        }
+
+        private static void HorizontalBlur(byte[] src, byte[] dst, int w, int h, int stride, int r)
+        {
+            int div = r * 2 + 1;
+            for (int y = 0; y < h; y++)
+            {
+                int row = y * stride;
+                int sumB = 0, sumG = 0, sumR = 0, sumA = 0;
+                for (int x = -r; x <= r; x++)
+                {
+                    int cx = Clamp(x, 0, w - 1) * 4 + row;
+                    sumB += src[cx]; sumG += src[cx + 1]; sumR += src[cx + 2]; sumA += src[cx + 3];
+                }
+                for (int x = 0; x < w; x++)
+                {
+                    int o = row + x * 4;
+                    dst[o] = (byte)(sumB / div); dst[o + 1] = (byte)(sumG / div);
+                    dst[o + 2] = (byte)(sumR / div); dst[o + 3] = (byte)(sumA / div);
+                    int add = Clamp(x + r + 1, 0, w - 1) * 4 + row;
+                    int sub = Clamp(x - r, 0, w - 1) * 4 + row;
+                    sumB += src[add] - src[sub]; sumG += src[add + 1] - src[sub + 1];
+                    sumR += src[add + 2] - src[sub + 2]; sumA += src[add + 3] - src[sub + 3];
+                }
+            }
+        }
+
+        private static void VerticalBlur(byte[] src, byte[] dst, int w, int h, int stride, int r)
+        {
+            int div = r * 2 + 1;
+            for (int x = 0; x < w; x++)
+            {
+                int col = x * 4;
+                int sumB = 0, sumG = 0, sumR = 0, sumA = 0;
+                for (int y = -r; y <= r; y++)
+                {
+                    int cy = Clamp(y, 0, h - 1) * stride + col;
+                    sumB += src[cy]; sumG += src[cy + 1]; sumR += src[cy + 2]; sumA += src[cy + 3];
+                }
+                for (int y = 0; y < h; y++)
+                {
+                    int o = y * stride + col;
+                    dst[o] = (byte)(sumB / div); dst[o + 1] = (byte)(sumG / div);
+                    dst[o + 2] = (byte)(sumR / div); dst[o + 3] = (byte)(sumA / div);
+                    int add = Clamp(y + r + 1, 0, h - 1) * stride + col;
+                    int sub = Clamp(y - r, 0, h - 1) * stride + col;
+                    sumB += src[add] - src[sub]; sumG += src[add + 1] - src[sub + 1];
+                    sumR += src[add + 2] - src[sub + 2]; sumA += src[add + 3] - src[sub + 3];
+                }
+            }
+        }
+
+        private static int Clamp(int v, int lo, int hi) { return v < lo ? lo : (v > hi ? hi : v); }
+    }
+
+    // =========================================================================
+    //  主表單：雙態介面 + 低階鉤子（第 3、4 節）
+    // =========================================================================
+    internal sealed class LockForm : Form
+    {
+        private enum UiState { Idle, Input }
+
+        private readonly AppConfig _cfg;
+        private readonly Rectangle _virtualScreen;
+        private readonly Rectangle _primaryLocal;   // 主螢幕區域（表單座標）
+        private Bitmap _background;
+
+        private UiState _state = UiState.Idle;
+        private readonly StringBuilder _input = new StringBuilder();
+        private bool _showError;
+
+        private DateTime _lastActivity = DateTime.Now;
+        private string _lastMinute = "";
+        private readonly System.Windows.Forms.Timer _tick = new System.Windows.Forms.Timer();
+
+        // 鉤子
+        private IntPtr _kbHook = IntPtr.Zero;
+        private IntPtr _msHook = IntPtr.Zero;
+        private NativeMethods.LowLevelProc _kbProc;   // 保持參考避免 GC 回收
+        private NativeMethods.LowLevelProc _msProc;
+
+        // 手動追蹤的鍵盤狀態（供 ToUnicode 用）
+        private readonly byte[] _keyState = new byte[256];
+
+        public LockForm(AppConfig cfg)
+        {
+            _cfg = cfg;
+            _virtualScreen = SystemInformation.VirtualScreen;
+
+            var pb = Screen.PrimaryScreen.Bounds;
+            _primaryLocal = new Rectangle(pb.Left - _virtualScreen.Left, pb.Top - _virtualScreen.Top, pb.Width, pb.Height);
+
+            // 表單樣式：無邊框、最上層、覆蓋整個虛擬螢幕
+            FormBorderStyle = FormBorderStyle.None;
+            ShowInTaskbar = false;
+            TopMost = true;
+            StartPosition = FormStartPosition.Manual;
+            Bounds = _virtualScreen;
+            BackColor = Color.Black;
+            DoubleBuffered = true;
+            Cursor = Cursors.Default;
+
+            Load += OnLoad;
+            FormClosed += OnClosed;
+            Paint += OnPaint;
+
+            _tick.Interval = 250;   // 時鐘更新與逾時檢查
+            _tick.Tick += OnTick;
+        }
+
+        private void OnLoad(object sender, EventArgs e)
+        {
+            // 背景需在表單顯示「之前」截圖才不會把自己拍進去——故在這裡先隱藏再截。
+            Opacity = 0;
+            _background = BackgroundFactory.Build(_cfg.background, _virtualScreen);
+            Opacity = 1;
+
+            Cursor.Hide();
+            TopMost = true;
+            Activate();
+
+            InstallHooks();
+            _tick.Start();
+            Invalidate();
+        }
+
+        private void OnClosed(object sender, FormClosedEventArgs e)
+        {
+            _tick.Stop();
+            UninstallHooks();
+            Cursor.Show();
+            if (_background != null) { _background.Dispose(); _background = null; }
+        }
+
+        private void OnTick(object sender, EventArgs e)
+        {
+            bool needPaint = false;
+
+            // 輸入態逾時 → 退回閒置態（第 4 節）
+            if (_state == UiState.Input)
+            {
+                double idle = (DateTime.Now - _lastActivity).TotalSeconds;
+                if (idle >= _cfg.idleTimeoutSec)
+                {
+                    _state = UiState.Idle;
+                    _input.Clear();
+                    _showError = false;
+                    needPaint = true;   // 面板要收起
+                }
+            }
+
+            // 時鐘只顯示到分鐘，分鐘變了才需重畫（避免每秒重繪整個全螢幕背景）
+            string nowMinute = DateTime.Now.ToString("HH:mm");
+            if (nowMinute != _lastMinute) { _lastMinute = nowMinute; needPaint = true; }
+
+            if (needPaint) Invalidate();
+        }
+
+        // ---- 繪製 ----
+        private void OnPaint(object sender, PaintEventArgs e)
+        {
+            var g = e.Graphics;
+            g.TextRenderingHint = TextRenderingHint.ClearTypeGridFit;
+
+            if (_background != null) g.DrawImageUnscaled(_background, 0, 0);
+            else g.Clear(Color.Black);
+
+            // 內建時鐘（閒置態與輸入態都顯示）
+            if (_cfg.showClock) ClockRenderer.Draw(g, _primaryLocal);
+
+            // 輸入態：密碼面板
+            if (_state == UiState.Input) DrawPasswordPanel(g);
+        }
+
+        // 面板縮放倍率（以 1080p 為基準，夾在 1.0~3.0 倍）
+        private float PanelScale()
+        {
+            float scale = _primaryLocal.Height / 1080f;
+            if (scale < 1f) scale = 1f;
+            if (scale > 3f) scale = 3f;
+            return scale;
+        }
+
+        private Rectangle GetPanelRect()
+        {
+            var s = _primaryLocal;
+            float scale = PanelScale();
+            int panelW = Math.Min((int)(560 * scale), s.Width - 80);
+            int panelH = (int)(210 * scale);
+            int px = s.Left + (s.Width - panelW) / 2;
+            int py = s.Top + (int)(s.Height * 0.60);
+            return new Rectangle(px, py, panelW, panelH);
+        }
+
+        // 只重繪密碼面板區域（避免每次按鍵重畫整個全螢幕背景）
+        private void InvalidatePanel()
+        {
+            var r = GetPanelRect();
+            r.Inflate(8, 8);
+            Invalidate(r);
+        }
+
+        private void DrawPasswordPanel(Graphics g)
+        {
+            float scale = PanelScale();
+            var panel = GetPanelRect();
+
+            int pad = (int)(28 * scale);
+            int corner = (int)(16 * scale);
+
+            using (var back = new SolidBrush(Color.FromArgb(170, 20, 20, 24)))
+            using (var path = RoundedRect(panel, corner))
+                g.FillPath(back, path);
+
+            using (var titleFont = new Font("Segoe UI", 20 * scale, FontStyle.Regular, GraphicsUnit.Pixel))
+            using (var white = new SolidBrush(Color.White))
+            using (var fmt = new StringFormat { Alignment = StringAlignment.Center })
+                g.DrawString("輸入密碼以解鎖", titleFont, white, panel.Left + panel.Width / 2f, panel.Top + pad * 0.6f, fmt);
+
+            // 遮罩點（● 第 7 節）
+            string masked = new string('●', _input.Length);
+            int boxH = (int)(64 * scale);
+            int boxY = panel.Top + (int)(64 * scale);
+            using (var boxFont = new Font("Consolas", 36 * scale, FontStyle.Regular, GraphicsUnit.Pixel))
+            using (var white = new SolidBrush(Color.White))
+            using (var fmt = new StringFormat { Alignment = StringAlignment.Center, LineAlignment = StringAlignment.Center })
+            {
+                var box = new Rectangle(panel.Left + pad, boxY, panel.Width - pad * 2, boxH);
+                using (var boxBrush = new SolidBrush(Color.FromArgb(120, 0, 0, 0)))
+                using (var bp = RoundedRect(box, (int)(10 * scale)))
+                    g.FillPath(boxBrush, bp);
+                g.DrawString(masked.Length == 0 ? "" : masked, boxFont, white, box, fmt);
+            }
+
+            // 錯誤提示 / 操作提示
+            float footY = panel.Bottom - (int)(34 * scale);
+            if (_showError)
+            {
+                using (var errFont = new Font("Segoe UI", 18 * scale, FontStyle.Bold, GraphicsUnit.Pixel))
+                using (var red = new SolidBrush(Color.FromArgb(255, 120, 120)))
+                using (var fmt = new StringFormat { Alignment = StringAlignment.Center })
+                    g.DrawString("密碼錯誤", errFont, red, panel.Left + panel.Width / 2f, footY, fmt);
+            }
+            else
+            {
+                using (var tipFont = new Font("Segoe UI", 15 * scale, FontStyle.Regular, GraphicsUnit.Pixel))
+                using (var gray = new SolidBrush(Color.FromArgb(180, 200, 200, 200)))
+                using (var fmt = new StringFormat { Alignment = StringAlignment.Center })
+                    g.DrawString("Enter 確認 · Backspace 刪除 · Esc 清空", tipFont, gray, panel.Left + panel.Width / 2f, footY, fmt);
+            }
+        }
+
+        private static GraphicsPath RoundedRect(Rectangle r, int radius)
+        {
+            var path = new GraphicsPath();
+            int d = radius * 2;
+            path.AddArc(r.Left, r.Top, d, d, 180, 90);
+            path.AddArc(r.Right - d, r.Top, d, d, 270, 90);
+            path.AddArc(r.Right - d, r.Bottom - d, d, d, 0, 90);
+            path.AddArc(r.Left, r.Bottom - d, d, d, 90, 90);
+            path.CloseFigure();
+            return path;
+        }
+
+        // ---- 鉤子安裝 / 卸載 ----
+        private void InstallHooks()
+        {
+            _kbProc = KeyboardProc;
+            _msProc = MouseProc;
+            using (var proc = System.Diagnostics.Process.GetCurrentProcess())
+            using (var mod = proc.MainModule)
+            {
+                IntPtr hMod = NativeMethods.GetModuleHandle(mod.ModuleName);
+                _kbHook = NativeMethods.SetWindowsHookEx(NativeMethods.WH_KEYBOARD_LL, _kbProc, hMod, 0);
+                _msHook = NativeMethods.SetWindowsHookEx(NativeMethods.WH_MOUSE_LL, _msProc, hMod, 0);
+            }
+        }
+
+        private void UninstallHooks()
+        {
+            if (_kbHook != IntPtr.Zero) { NativeMethods.UnhookWindowsHookEx(_kbHook); _kbHook = IntPtr.Zero; }
+            if (_msHook != IntPtr.Zero) { NativeMethods.UnhookWindowsHookEx(_msHook); _msHook = IntPtr.Zero; }
+        }
+
+        // ---- 鍵盤鉤子：吞掉所有事件，於此組密碼字串（第 7 節）----
+        private IntPtr KeyboardProc(int nCode, IntPtr wParam, IntPtr lParam)
+        {
+            if (nCode >= 0)
+            {
+                int msg = wParam.ToInt32();
+                var data = (NativeMethods.KBDLLHOOKSTRUCT)Marshal.PtrToStructure(lParam, typeof(NativeMethods.KBDLLHOOKSTRUCT));
+                int vk = (int)data.vkCode;
+
+                bool isDown = (msg == NativeMethods.WM_KEYDOWN || msg == NativeMethods.WM_SYSKEYDOWN);
+                bool isUp = (msg == NativeMethods.WM_KEYUP || msg == NativeMethods.WM_SYSKEYUP);
+
+                UpdateModifierState(vk, isDown, isUp);
+
+                if (isDown)
+                {
+                    // 任意鍵喚醒 → 切換至輸入態
+                    WakeToInput();
+                    HandleKeyDown(vk, data.scanCode);
+                    // 立即重繪密碼面板，讓輸入即時反映（不必等計時器，消除延遲感）
+                    InvalidatePanel();
+                }
+            }
+            // 全程吞掉，實體輸入不傳入系統（第 4 節）
+            return (IntPtr)1;
+        }
+
+        private void UpdateModifierState(int vk, bool isDown, bool isUp)
+        {
+            const int VK_SHIFT = 0x10, VK_LSHIFT = 0xA0, VK_RSHIFT = 0xA1;
+            const int VK_CONTROL = 0x11, VK_MENU = 0x12;
+            const int VK_CAPITAL = 0x14;
+
+            byte on = 0x80;
+            if (vk == VK_SHIFT || vk == VK_LSHIFT || vk == VK_RSHIFT)
+                _keyState[VK_SHIFT] = isDown ? on : (byte)0;
+            else if (vk == VK_CONTROL)
+                _keyState[VK_CONTROL] = isDown ? on : (byte)0;
+            else if (vk == VK_MENU)
+                _keyState[VK_MENU] = isDown ? on : (byte)0;
+            else if (vk == VK_CAPITAL && isDown)
+                _keyState[VK_CAPITAL] ^= 0x01;   // 切換 CapsLock 低位
+        }
+
+        private void HandleKeyDown(int vk, uint scanCode)
+        {
+            const int VK_RETURN = 0x0D, VK_BACK = 0x08, VK_ESCAPE = 0x1B;
+
+            if (vk == VK_RETURN)
+            {
+                if (PasswordManager.Verify(_cfg, _input.ToString()))
+                {
+                    Unlock();
+                }
+                else
+                {
+                    _input.Clear();
+                    _showError = true;
+                }
+                return;
+            }
+            if (vk == VK_BACK)
+            {
+                if (_input.Length > 0) _input.Length--;
+                _showError = false;
+                return;
+            }
+            if (vk == VK_ESCAPE)
+            {
+                _input.Clear();
+                _showError = false;
+                return;
+            }
+
+            // 一般可列印字元：以 ToUnicode 組字
+            string ch = TranslateToChar(vk, scanCode);
+            if (!string.IsNullOrEmpty(ch))
+            {
+                _input.Append(ch);
+                _showError = false;
+            }
+        }
+
+        private string TranslateToChar(int vk, uint scanCode)
+        {
+            var sb = new StringBuilder(8);
+            IntPtr layout = NativeMethods.GetKeyboardLayout(0);
+            int rc = NativeMethods.ToUnicodeEx((uint)vk, scanCode, _keyState, sb, sb.Capacity, 0, layout);
+            if (rc > 0)
+            {
+                string s = sb.ToString();
+                // 過濾控制字元
+                if (s.Length > 0 && !char.IsControl(s[0])) return s;
+            }
+            return null;
+        }
+
+        private void WakeToInput()
+        {
+            _lastActivity = DateTime.Now;
+            if (_state != UiState.Input)
+            {
+                _state = UiState.Input;
+                _input.Clear();
+                _showError = false;
+            }
+        }
+
+        private void Unlock()
+        {
+            // 解鎖 → 關閉本鎖屏視窗並釋放鉤子（OnClosed 卸載）；返回設定主視窗，不結束整個程式。
+            BeginInvoke((MethodInvoker)(() =>
+            {
+                DialogResult = DialogResult.OK;
+                Close();
+            }));
+        }
+
+        // ---- 滑鼠鉤子：吞掉所有事件，移動 / 點擊用於喚醒 UI（第 4 節）----
+        private IntPtr MouseProc(int nCode, IntPtr wParam, IntPtr lParam)
+        {
+            if (nCode >= 0)
+            {
+                int msg = wParam.ToInt32();
+                // 移動、點擊、滾輪皆視為喚醒
+                if (msg == NativeMethods.WM_MOUSEMOVE ||
+                    msg == NativeMethods.WM_LBUTTONDOWN || msg == NativeMethods.WM_RBUTTONDOWN ||
+                    msg == NativeMethods.WM_MBUTTONDOWN || msg == NativeMethods.WM_MOUSEWHEEL)
+                {
+                    _lastActivity = DateTime.Now;
+                    if (_state != UiState.Input)
+                    {
+                        // 滑鼠喚醒不清空輸入緩衝（其本就為空），但要切換狀態並重繪
+                        _state = UiState.Input;
+                        BeginInvoke((MethodInvoker)Invalidate);
+                    }
+                }
+            }
+            return (IntPtr)1;   // 吞掉所有滑鼠事件
+        }
+
+        // 確保表單一直在最上層（防其他視窗搶焦點）
+        protected override void OnDeactivate(EventArgs e)
+        {
+            base.OnDeactivate(e);
+            TopMost = true;
+        }
+    }
+
+    // =========================================================================
+    //  Win32 互操作
+    // =========================================================================
+    internal static class NativeMethods
+    {
+        public const int WH_KEYBOARD_LL = 13;
+        public const int WH_MOUSE_LL = 14;
+
+        public const int WM_KEYDOWN = 0x0100;
+        public const int WM_KEYUP = 0x0101;
+        public const int WM_SYSKEYDOWN = 0x0104;
+        public const int WM_SYSKEYUP = 0x0105;
+
+        public const int WM_MOUSEMOVE = 0x0200;
+        public const int WM_LBUTTONDOWN = 0x0201;
+        public const int WM_RBUTTONDOWN = 0x0204;
+        public const int WM_MBUTTONDOWN = 0x0207;
+        public const int WM_MOUSEWHEEL = 0x020A;
+
+        public delegate IntPtr LowLevelProc(int nCode, IntPtr wParam, IntPtr lParam);
+
+        [StructLayout(LayoutKind.Sequential)]
+        public struct KBDLLHOOKSTRUCT
+        {
+            public uint vkCode;
+            public uint scanCode;
+            public uint flags;
+            public uint time;
+            public IntPtr dwExtraInfo;
+        }
+
+        [DllImport("user32.dll", SetLastError = true)]
+        public static extern IntPtr SetWindowsHookEx(int idHook, LowLevelProc lpfn, IntPtr hMod, uint dwThreadId);
+
+        [DllImport("user32.dll", SetLastError = true)]
+        public static extern bool UnhookWindowsHookEx(IntPtr hhk);
+
+        [DllImport("user32.dll", SetLastError = true)]
+        public static extern IntPtr CallNextHookEx(IntPtr hhk, int nCode, IntPtr wParam, IntPtr lParam);
+
+        // 全域熱鍵
+        public const int WM_HOTKEY = 0x0312;
+        public const uint MOD_ALT = 0x0001, MOD_CONTROL = 0x0002, MOD_SHIFT = 0x0004, MOD_WIN = 0x0008, MOD_NOREPEAT = 0x4000;
+
+        [DllImport("user32.dll", SetLastError = true)]
+        public static extern bool RegisterHotKey(IntPtr hWnd, int id, uint fsModifiers, uint vk);
+
+        [DllImport("user32.dll", SetLastError = true)]
+        public static extern bool UnregisterHotKey(IntPtr hWnd, int id);
+
+        [DllImport("kernel32.dll", SetLastError = true, CharSet = CharSet.Auto)]
+        public static extern IntPtr GetModuleHandle(string lpModuleName);
+
+        // DPI 感知：讓截圖與座標使用實體像素，修正高 DPI / 多螢幕下截圖只截一部分的問題。
+        [DllImport("user32.dll")]
+        public static extern bool SetProcessDPIAware();
+
+        [DllImport("user32.dll")]
+        public static extern bool SetProcessDpiAwarenessContext(IntPtr value);
+
+        // DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2 = -4（Win10 1703+）
+        public static readonly IntPtr DPI_PER_MONITOR_V2 = new IntPtr(-4);
+
+        public static void EnableDpiAwareness()
+        {
+            // 採 System Aware：足以修正截圖的像素不一致，且 WinForms .NET Framework
+            // 對 System DPI 有良好的字體 / 佈局自動縮放（PMv2 在 4.x 反而會讓視窗變小）。
+            try { SetProcessDPIAware(); } catch { }
+        }
+
+        [DllImport("user32.dll")]
+        public static extern IntPtr GetKeyboardLayout(uint idThread);
+
+        [DllImport("user32.dll")]
+        public static extern int ToUnicodeEx(uint wVirtKey, uint wScanCode, byte[] lpKeyState,
+            [Out, MarshalAs(UnmanagedType.LPWStr)] StringBuilder pwszBuff, int cchBuff, uint wFlags, IntPtr dwhkl);
+    }
+
+    // =========================================================================
+    //  即時預覽控制項 —— 縮放繪製背景與 widgets，所見即所得（依老爺指示）。
+    // =========================================================================
+    internal sealed class PreviewPanel : Panel
+    {
+        private AppConfig _cfg;
+        private Bitmap _desktopThumb;        // 主螢幕截圖縮圖（原圖，未模糊）
+        private readonly Rectangle _primary;
+        private readonly System.Windows.Forms.Timer _clock = new System.Windows.Forms.Timer();
+
+        public PreviewPanel()
+        {
+            _primary = Screen.PrimaryScreen.Bounds;
+            DoubleBuffered = true;
+            BackColor = Color.Black;
+            CaptureDesktop();
+            _clock.Interval = 1000;           // 讓預覽的時鐘也會跳秒
+            _clock.Tick += (s, e) => Invalidate();
+            _clock.Start();
+        }
+
+        public void SetConfig(AppConfig cfg) { _cfg = cfg; Invalidate(); }
+
+        private void CaptureDesktop()
+        {
+            try
+            {
+                int tw = 640;
+                int th = Math.Max(1, (int)(_primary.Height * (640.0 / _primary.Width)));
+                var thumb = new Bitmap(tw, th, PixelFormat.Format32bppPArgb);
+                using (var full = new Bitmap(_primary.Width, _primary.Height, PixelFormat.Format32bppPArgb))
+                {
+                    using (var g = Graphics.FromImage(full))
+                        g.CopyFromScreen(_primary.Left, _primary.Top, 0, 0, _primary.Size, CopyPixelOperation.SourceCopy);
+                    using (var g = Graphics.FromImage(thumb))
+                    {
+                        g.InterpolationMode = InterpolationMode.HighQualityBilinear;
+                        g.DrawImage(full, 0, 0, tw, th);
+                    }
+                }
+                if (_desktopThumb != null) _desktopThumb.Dispose();
+                _desktopThumb = thumb;
+            }
+            catch { }
+        }
+
+        // 重新擷取桌面（鎖定前後桌面可能有變化時用）
+        public void RefreshDesktop() { CaptureDesktop(); Invalidate(); }
+
+        protected override void OnPaint(PaintEventArgs e)
+        {
+            var g = e.Graphics;
+            g.Clear(Color.Black);
+            if (_cfg == null) return;
+
+            // 維持主螢幕比例，置中（letterbox）
+            var area = ClientRectangle;
+            double scale = Math.Min((double)area.Width / _primary.Width, (double)area.Height / _primary.Height);
+            int dw = (int)(_primary.Width * scale), dh = (int)(_primary.Height * scale);
+            int dx = area.Left + (area.Width - dw) / 2, dy = area.Top + (area.Height - dh) / 2;
+            var dest = new Rectangle(dx, dy, dw, dh);
+
+            // 背景
+            using (var bg = BuildPreviewBackground(dw, dh))
+                if (bg != null) g.DrawImage(bg, dest);
+
+            // 內建時鐘（用縮放座標，使字級/位置與實機一致）
+            g.TextRenderingHint = TextRenderingHint.ClearTypeGridFit;
+            if (_cfg.showClock)
+            {
+                var state = g.Save();
+                g.TranslateTransform(dx, dy);
+                g.ScaleTransform((float)scale, (float)scale);
+                ClockRenderer.Draw(g, new Rectangle(0, 0, _primary.Width, _primary.Height));
+                g.Restore(state);
+            }
+
+            // 邊框
+            using (var pen = new Pen(Color.FromArgb(80, 255, 255, 255)))
+                g.DrawRectangle(pen, dest.Left, dest.Top, dest.Width - 1, dest.Height - 1);
+        }
+
+        private Bitmap BuildPreviewBackground(int w, int h)
+        {
+            if (w < 1 || h < 1) return null;
+            var bg = _cfg.background;
+            var bmp = new Bitmap(w, h, PixelFormat.Format32bppPArgb);
+            using (var g = Graphics.FromImage(bmp))
+            {
+                g.InterpolationMode = InterpolationMode.HighQualityBilinear;
+                switch ((bg.type ?? "").ToLowerInvariant())
+                {
+                    case "soliddark":
+                        g.Clear(Color.FromArgb(18, 18, 20));
+                        break;
+                    case "image":
+                        try
+                        {
+                            if (!string.IsNullOrEmpty(bg.path) && File.Exists(bg.path))
+                                using (var src = new Bitmap(bg.path))
+                                {
+                                    double s = Math.Max((double)w / src.Width, (double)h / src.Height);
+                                    int iw = (int)(src.Width * s), ih = (int)(src.Height * s);
+                                    g.DrawImage(src, (w - iw) / 2, (h - ih) / 2, iw, ih);
+                                }
+                            else g.Clear(Color.FromArgb(18, 18, 20));
+                        }
+                        catch { g.Clear(Color.FromArgb(18, 18, 20)); }
+                        break;
+                    case "blurdesktop":
+                    default:
+                        if (_desktopThumb != null) g.DrawImage(_desktopThumb, 0, 0, w, h);
+                        else g.Clear(Color.FromArgb(18, 18, 20));
+                        break;
+                }
+            }
+
+            string type = (bg.type ?? "").ToLowerInvariant();
+            if ((type == "blurdesktop" || type == "image") && bg.blur > 0)
+            {
+                // 預覽尺寸已小，半徑相應縮放
+                int r = Math.Max(1, (int)Math.Round(bg.blur * (w / (double)_primary.Width) * 1.5));
+                ImageBlur.GaussianApprox(bmp, r);
+            }
+            if (type != "soliddark") ApplyDimPreview(bmp, bg.dim);
+            return bmp;
+        }
+
+        private static void ApplyDimPreview(Bitmap bmp, double dim)
+        {
+            if (dim <= 0) return; if (dim > 1) dim = 1;
+            using (var g = Graphics.FromImage(bmp))
+            using (var b = new SolidBrush(Color.FromArgb((int)(dim * 255), 0, 0, 0)))
+                g.FillRectangle(b, 0, 0, bmp.Width, bmp.Height);
+        }
+
+        protected override void Dispose(bool disposing)
+        {
+            if (disposing) { _clock.Dispose(); if (_desktopThumb != null) _desktopThumb.Dispose(); }
+            base.Dispose(disposing);
+        }
+    }
+
+    // =========================================================================
+    //  設定主視窗（依老爺指示：主視窗即設定面板，關閉縮到系統匣）
+    // =========================================================================
+    internal sealed class SettingsForm : Form
+    {
+        private readonly string _cfgPath;
+        private AppConfig _cfg;
+
+        private ComboBox _bgType;
+        private NumericUpDown _blur, _dim, _idle;
+        private TextBox _imagePath;
+        private Button _browseImage;
+        private CheckBox _showClock;
+        private PreviewPanel _preview;
+        private TextBox _pw1, _pw2;
+        private TextBox _rescue1, _rescue2;
+        private Label _pwStatus;
+        private Label _rescueStatus;
+        private NotifyIcon _tray;
+        private TextBox _hotkeyBox;
+        private Label _hotkeyStatus;
+        private bool _reallyExit;
+        private bool _binding;                                    // 載入設定到畫面期間，抑制控制項事件回寫
+        private bool _hotkeyRecording;                            // 快捷鍵錄製模式
+        private bool _isLocking;                                   // 防止鎖定中重入（熱鍵連按 / 按鈕）
+        private bool _hotkeyRegistered;
+        private const int HOTKEY_ID = 0xA11C;
+        private DateTime _lockCooldownUntil = DateTime.MinValue;   // 解鎖後忽略鎖定請求的期間
+
+        public SettingsForm(string cfgPath)
+        {
+            _cfgPath = cfgPath;
+            _cfg = AppConfig.LoadOrDefault(cfgPath);
+
+            Text = "鍵鼠鎖定 — 設定";
+            StartPosition = FormStartPosition.CenterScreen;
+            ClientSize = new Size(940, 620);
+            MinimumSize = new Size(900, 600);
+            Font = new Font("Segoe UI", 9f);
+
+            BuildUi();
+            BindFromConfig();
+
+            FormClosing += OnFormClosing;
+            BuildTray();
+        }
+
+        // ---- 介面建構 ----
+        private void BuildUi()
+        {
+            // 左：設定欄；右：即時預覽
+            var split = new SplitContainer
+            {
+                Dock = DockStyle.Fill,
+                Orientation = Orientation.Vertical,
+                FixedPanel = FixedPanel.Panel2
+            };
+            Controls.Add(split);
+            try { split.SplitterDistance = 460; } catch { }
+
+            // ===== 左側設定 =====
+            var left = new TableLayoutPanel { Dock = DockStyle.Fill, ColumnCount = 1, Padding = new Padding(12), AutoScroll = true };
+            split.Panel1.Controls.Add(left);
+
+            left.Controls.Add(SectionLabel("背景"));
+
+            var bgPanel = new TableLayoutPanel { ColumnCount = 4, AutoSize = true, Dock = DockStyle.Top };
+            bgPanel.Controls.Add(new Label { Text = "類型", AutoSize = true, Anchor = AnchorStyles.Left, Margin = new Padding(3, 7, 3, 3) }, 0, 0);
+            _bgType = new ComboBox { DropDownStyle = ComboBoxStyle.DropDownList, Width = 140 };
+            _bgType.Items.AddRange(new object[] { "blurDesktop", "image", "solidDark" });
+            _bgType.SelectedIndexChanged += (s, e) => { Pull(); UpdatePreview(); };
+            bgPanel.Controls.Add(_bgType, 1, 0);
+
+            bgPanel.Controls.Add(new Label { Text = "模糊", AutoSize = true, Anchor = AnchorStyles.Left, Margin = new Padding(12, 7, 3, 3) }, 2, 0);
+            _blur = new NumericUpDown { Minimum = 0, Maximum = 60, Width = 70 };
+            _blur.ValueChanged += (s, e) => { Pull(); UpdatePreview(); };
+            bgPanel.Controls.Add(_blur, 3, 0);
+
+            bgPanel.Controls.Add(new Label { Text = "變暗 %", AutoSize = true, Anchor = AnchorStyles.Left, Margin = new Padding(3, 7, 3, 3) }, 0, 1);
+            _dim = new NumericUpDown { Minimum = 0, Maximum = 100, Width = 70 };
+            _dim.ValueChanged += (s, e) => { Pull(); UpdatePreview(); };
+            bgPanel.Controls.Add(_dim, 1, 1);
+            left.Controls.Add(bgPanel);
+
+            var imgPanel = new TableLayoutPanel { ColumnCount = 3, AutoSize = true, Dock = DockStyle.Top };
+            imgPanel.Controls.Add(new Label { Text = "圖片", AutoSize = true, Anchor = AnchorStyles.Left, Margin = new Padding(3, 7, 3, 3) }, 0, 0);
+            _imagePath = new TextBox { Width = 280 };
+            _imagePath.TextChanged += (s, e) => { Pull(); UpdatePreview(); };
+            imgPanel.Controls.Add(_imagePath, 1, 0);
+            _browseImage = new Button { Text = "瀏覽…", AutoSize = true };
+            _browseImage.Click += BrowseImage;
+            imgPanel.Controls.Add(_browseImage, 2, 0);
+            left.Controls.Add(imgPanel);
+
+            left.Controls.Add(SectionLabel("行為"));
+            var behav = new TableLayoutPanel { ColumnCount = 3, AutoSize = true, Dock = DockStyle.Top };
+            behav.Controls.Add(new Label { Text = "輸入逾時（秒）", AutoSize = true, Anchor = AnchorStyles.Left, Margin = new Padding(3, 7, 3, 3) }, 0, 0);
+            _idle = new NumericUpDown { Minimum = 3, Maximum = 120, Width = 70 };
+            _idle.ValueChanged += (s, e) => Pull();
+            behav.Controls.Add(_idle, 1, 0);
+
+            behav.Controls.Add(new Label { Text = "鎖定快捷鍵", AutoSize = true, Anchor = AnchorStyles.Left, Margin = new Padding(3, 7, 3, 3) }, 0, 1);
+            _hotkeyBox = new TextBox { Width = 160, ReadOnly = true, Cursor = Cursors.Hand };
+            _hotkeyBox.KeyDown += HotkeyBox_KeyDown;
+            _hotkeyBox.Click += (s, e) => BeginHotkeyRecord();
+            _hotkeyBox.Leave += (s, e) => CancelHotkeyRecord();
+            behav.Controls.Add(_hotkeyBox, 1, 1);
+            var hkBtn = new Button { Text = "變更…", AutoSize = true };
+            hkBtn.Click += (s, e) => BeginHotkeyRecord();
+            behav.Controls.Add(hkBtn, 2, 1);
+            _hotkeyStatus = new Label { AutoSize = true, Margin = new Padding(3, 7, 3, 3), ForeColor = Color.DimGray };
+            behav.Controls.Add(_hotkeyStatus, 1, 2);
+            behav.Controls.Add(new Label { Text = "點「變更…」後，直接按下想要的組合鍵（如 Ctrl+Shift+L）", AutoSize = true, ForeColor = Color.DimGray, Margin = new Padding(3, 2, 3, 3) }, 1, 3);
+            left.Controls.Add(behav);
+
+            left.Controls.Add(SectionLabel("鎖屏顯示"));
+            _showClock = new CheckBox { Text = "顯示時鐘（畫面中央，字級隨螢幕自動縮放）", AutoSize = true, Margin = new Padding(3, 4, 3, 4) };
+            _showClock.CheckedChanged += (s, e) => { Pull(); UpdatePreview(); };
+            left.Controls.Add(_showClock);
+
+            left.Controls.Add(SectionLabel("變更主密碼"));
+            var pwPanel = new TableLayoutPanel { ColumnCount = 2, AutoSize = true, Dock = DockStyle.Top };
+            pwPanel.Controls.Add(new Label { Text = "新密碼", AutoSize = true, Anchor = AnchorStyles.Left, Margin = new Padding(3, 7, 3, 3) }, 0, 0);
+            _pw1 = new TextBox { Width = 200, UseSystemPasswordChar = true };
+            pwPanel.Controls.Add(_pw1, 1, 0);
+            pwPanel.Controls.Add(new Label { Text = "確認密碼", AutoSize = true, Anchor = AnchorStyles.Left, Margin = new Padding(3, 7, 3, 3) }, 0, 1);
+            _pw2 = new TextBox { Width = 200, UseSystemPasswordChar = true };
+            pwPanel.Controls.Add(_pw2, 1, 1);
+            var pwBtn = new Button { Text = "套用新密碼", AutoSize = true };
+            pwBtn.Click += ApplyPassword;
+            pwPanel.Controls.Add(pwBtn, 1, 2);
+            left.Controls.Add(pwPanel);
+            _pwStatus = new Label { AutoSize = true, ForeColor = Color.DimGray, Margin = new Padding(3, 4, 3, 8) };
+            left.Controls.Add(_pwStatus);
+
+            left.Controls.Add(SectionLabel("救援碼（可選 · 忘記主密碼時的後路）"));
+            var rsPanel = new TableLayoutPanel { ColumnCount = 2, AutoSize = true, Dock = DockStyle.Top };
+            rsPanel.Controls.Add(new Label { Text = "救援碼", AutoSize = true, Anchor = AnchorStyles.Left, Margin = new Padding(3, 7, 3, 3) }, 0, 0);
+            _rescue1 = new TextBox { Width = 200, UseSystemPasswordChar = true };
+            rsPanel.Controls.Add(_rescue1, 1, 0);
+            rsPanel.Controls.Add(new Label { Text = "確認救援碼", AutoSize = true, Anchor = AnchorStyles.Left, Margin = new Padding(3, 7, 3, 3) }, 0, 1);
+            _rescue2 = new TextBox { Width = 200, UseSystemPasswordChar = true };
+            rsPanel.Controls.Add(_rescue2, 1, 1);
+            var rsBtn = new Button { Text = "套用救援碼", AutoSize = true };
+            rsBtn.Click += ApplyRescue;
+            rsPanel.Controls.Add(rsBtn, 1, 2);
+            var rsClear = new Button { Text = "清除救援碼", AutoSize = true };
+            rsClear.Click += ClearRescue;
+            rsPanel.Controls.Add(rsClear, 1, 3);
+            left.Controls.Add(rsPanel);
+            _rescueStatus = new Label { AutoSize = true, ForeColor = Color.DimGray, Margin = new Padding(3, 4, 3, 8) };
+            left.Controls.Add(_rescueStatus);
+
+            // 底部按鈕列
+            var buttons = new FlowLayoutPanel { Dock = DockStyle.Bottom, FlowDirection = FlowDirection.RightToLeft, Height = 48, Padding = new Padding(8) };
+            var lockBtn = new Button { Text = "🔒 立即鎖定", AutoSize = true, Height = 32, BackColor = Color.FromArgb(40, 90, 160), ForeColor = Color.White, FlatStyle = FlatStyle.Flat };
+            lockBtn.Click += (s, e) => LockNow();
+            var saveBtn = new Button { Text = "儲存設定", AutoSize = true, Height = 32 };
+            saveBtn.Click += (s, e) => { Pull(); SaveConfig(); };
+            buttons.Controls.Add(lockBtn);
+            buttons.Controls.Add(saveBtn);
+            split.Panel1.Controls.Add(buttons);
+            buttons.BringToFront();
+
+            // ===== 右側預覽 =====
+            var right = new Panel { Dock = DockStyle.Fill, Padding = new Padding(10), BackColor = Color.FromArgb(30, 30, 34) };
+            split.Panel2.Controls.Add(right);
+            var previewTitle = new Label { Text = "即時預覽（鎖屏外觀）", Dock = DockStyle.Top, ForeColor = Color.Gainsboro, Height = 22 };
+            _preview = new PreviewPanel { Dock = DockStyle.Fill };
+            right.Controls.Add(_preview);
+            right.Controls.Add(previewTitle);
+        }
+
+        private static Label SectionLabel(string text)
+        {
+            return new Label
+            {
+                Text = text,
+                AutoSize = true,
+                Font = new Font("Segoe UI", 10f, FontStyle.Bold),
+                Margin = new Padding(0, 12, 0, 4),
+                ForeColor = Color.FromArgb(40, 90, 160)
+            };
+        }
+
+        // ---- 資料繫結 ----
+        private void BindFromConfig()
+        {
+            // 設定控制項值會觸發 ValueChanged/SelectedIndexChanged → Pull()，
+            // 若此時表格尚未填好，會把 widgets 清空。故載入期間以 _binding 抑制回寫。
+            _binding = true;
+            try
+            {
+                _bgType.SelectedItem = MatchBgType(_cfg.background.type);
+                if (_bgType.SelectedItem == null) _bgType.SelectedIndex = 0;
+                _blur.Value = Clamp(_cfg.background.blur, 0, 60);
+                _dim.Value = Clamp((int)Math.Round(_cfg.background.dim * 100), 0, 100);
+                _imagePath.Text = _cfg.background.path ?? "";
+                _idle.Value = Clamp(_cfg.idleTimeoutSec, 3, 120);
+                _hotkeyBox.Text = string.IsNullOrWhiteSpace(_cfg.hotkey) ? "" : _cfg.hotkey;
+
+                _showClock.Checked = _cfg.showClock;
+                RefreshPwdStatus();
+            }
+            finally { _binding = false; }
+
+            _preview.SetConfig(_cfg);
+        }
+
+        private string MatchBgType(string t)
+        {
+            t = (t ?? "").ToLowerInvariant();
+            foreach (var item in _bgType.Items)
+                if (item.ToString().ToLowerInvariant() == t) return item.ToString();
+            return null;
+        }
+
+        // 將 UI 值寫回 _cfg（不存檔）
+        private void Pull()
+        {
+            if (_binding) return;   // 載入設定到畫面期間不可回寫（否則會用半成品畫面覆蓋設定）
+            _cfg.background.type = _bgType.SelectedItem != null ? _bgType.SelectedItem.ToString() : "blurDesktop";
+            _cfg.background.blur = (int)_blur.Value;
+            _cfg.background.dim = (double)_dim.Value / 100.0;
+            _cfg.background.path = string.IsNullOrWhiteSpace(_imagePath.Text) ? null : _imagePath.Text.Trim();
+            _cfg.idleTimeoutSec = (int)_idle.Value;
+            // 錄製中欄位顯示的是提示字，不可當成熱鍵值寫入
+            if (!_hotkeyRecording) _cfg.hotkey = (_hotkeyBox.Text ?? "").Trim();
+            _cfg.showClock = _showClock.Checked;
+        }
+
+        private void UpdatePreview() { _preview.SetConfig(_cfg); }
+
+        // ---- 動作 ----
+        private void BrowseImage(object sender, EventArgs e)
+        {
+            using (var dlg = new OpenFileDialog { Filter = "圖片檔|*.png;*.jpg;*.jpeg;*.bmp|所有檔案|*.*" })
+                if (dlg.ShowDialog(this) == DialogResult.OK)
+                {
+                    _imagePath.Text = dlg.FileName;
+                    if (MatchBgType("image") != null) _bgType.SelectedItem = MatchBgType("image");
+                    Pull(); UpdatePreview();
+                }
+        }
+
+        private void ApplyPassword(object sender, EventArgs e)
+        {
+            string a = _pw1.Text, b = _pw2.Text;
+            if (string.IsNullOrEmpty(a))
+            {
+                MessageBox.Show(this, "新密碼不可為空。", "變更密碼", MessageBoxButtons.OK, MessageBoxIcon.Warning);
+                return;
+            }
+            if (a != b)
+            {
+                MessageBox.Show(this, "兩次輸入不一致。", "變更密碼", MessageBoxButtons.OK, MessageBoxIcon.Warning);
+                return;
+            }
+            PasswordManager.SetPassword(_cfg, a);
+            Pull();
+            SaveConfig();
+            _pw1.Clear(); _pw2.Clear();
+            RefreshPwdStatus();
+            MessageBox.Show(this, "主密碼已更新並儲存。", "變更密碼", MessageBoxButtons.OK, MessageBoxIcon.Information);
+        }
+
+        private void ApplyRescue(object sender, EventArgs e)
+        {
+            string a = _rescue1.Text, b = _rescue2.Text;
+            if (string.IsNullOrEmpty(a))
+            {
+                MessageBox.Show(this, "救援碼不可為空（若要移除請按「清除救援碼」）。", "救援碼", MessageBoxButtons.OK, MessageBoxIcon.Warning);
+                return;
+            }
+            if (a != b)
+            {
+                MessageBox.Show(this, "兩次輸入不一致。", "救援碼", MessageBoxButtons.OK, MessageBoxIcon.Warning);
+                return;
+            }
+            PasswordManager.SetRescue(_cfg, a);
+            SaveConfig();
+            _rescue1.Clear(); _rescue2.Clear();
+            RefreshPwdStatus();
+            MessageBox.Show(this, "救援碼已設定並儲存。", "救援碼", MessageBoxButtons.OK, MessageBoxIcon.Information);
+        }
+
+        private void ClearRescue(object sender, EventArgs e)
+        {
+            PasswordManager.SetRescue(_cfg, null);
+            SaveConfig();
+            _rescue1.Clear(); _rescue2.Clear();
+            RefreshPwdStatus();
+            MessageBox.Show(this, "救援碼已清除。", "救援碼", MessageBoxButtons.OK, MessageBoxIcon.Information);
+        }
+
+        private void RefreshPwdStatus()
+        {
+            if (_pwStatus != null)
+                _pwStatus.Text = PasswordManager.HasMaster(_cfg)
+                    ? "目前：已設定主密碼。"
+                    : "⚠ 尚未設定主密碼——請先在此設定，才能使用鎖定。";
+            if (_pwStatus != null)
+                _pwStatus.ForeColor = PasswordManager.HasMaster(_cfg) ? Color.DimGray : Color.Firebrick;
+            if (_rescueStatus != null)
+                _rescueStatus.Text = PasswordManager.HasRescue(_cfg) ? "目前：已設定救援碼。" : "目前：未設定救援碼（可不設）。";
+        }
+
+        private void SaveConfig()
+        {
+            try { _cfg.Save(_cfgPath); }
+            catch (Exception ex)
+            {
+                MessageBox.Show(this, "儲存失敗：" + ex.Message, "錯誤", MessageBoxButtons.OK, MessageBoxIcon.Error);
+            }
+        }
+
+        private void LockNow()
+        {
+            // 防重入：鎖定中再按熱鍵 / 按鈕一律忽略。
+            if (_isLocking) return;
+            // 解鎖後短暫冷卻：擋掉解鎖那顆 Enter 的 autorepeat 殘留所誤觸的重複鎖定。
+            if (DateTime.Now < _lockCooldownUntil) return;
+
+            // 主密碼必設：未設定不允許鎖定，避免把自己鎖死。
+            if (!PasswordManager.HasMaster(_cfg))
+            {
+                RestoreFromTray();
+                RefreshPwdStatus();
+                MessageBox.Show(this, "尚未設定主密碼，無法鎖定。\n請先在「變更主密碼」設定一組密碼。", "尚未設定密碼", MessageBoxButtons.OK, MessageBoxIcon.Warning);
+                if (_pw1 != null) { _pw1.Focus(); }
+                return;
+            }
+
+            _isLocking = true;
+            Pull();
+            SaveConfig();
+            Hide();
+            // 讓設定視窗確實消失後再截背景
+            Application.DoEvents();
+            Thread.Sleep(180);
+            try
+            {
+                using (var lf = new LockForm(_cfg))
+                    lf.ShowDialog();
+            }
+            finally
+            {
+                _isLocking = false;
+                _lockCooldownUntil = DateTime.Now.AddMilliseconds(800);
+                Show();
+                WindowState = FormWindowState.Normal;
+                Activate();
+                // 清除焦點：避免解鎖殘留的 Enter 落到「立即鎖定」鈕而再次鎖定。
+                ActiveControl = null;
+                _preview.RefreshDesktop();
+            }
+        }
+
+        // ---- 全域熱鍵 ----
+        protected override void OnHandleCreated(EventArgs e)
+        {
+            base.OnHandleCreated(e);
+            RegisterLockHotkey(false);
+        }
+
+        // silent=false 時，註冊失敗會提示使用者。
+        private void RegisterLockHotkey(bool announce)
+        {
+            if (!IsHandleCreated) return;
+
+            if (_hotkeyRegistered)
+            {
+                NativeMethods.UnregisterHotKey(Handle, HOTKEY_ID);
+                _hotkeyRegistered = false;
+            }
+
+            uint mods, vk;
+            if (!ParseHotkey(_cfg.hotkey, out mods, out vk))
+            {
+                SetHotkeyStatus("✗ 未啟用（格式無法解析或留空）", Color.DimGray);
+                if (announce) MessageBox.Show(this, "快捷鍵格式無法解析，例：Ctrl+Alt+L", "快捷鍵", MessageBoxButtons.OK, MessageBoxIcon.Warning);
+                return;
+            }
+
+            bool ok = NativeMethods.RegisterHotKey(Handle, HOTKEY_ID, mods | NativeMethods.MOD_NOREPEAT, vk);
+            _hotkeyRegistered = ok;
+            if (ok)
+                SetHotkeyStatus("✓ 已啟用：" + _cfg.hotkey, Color.SeaGreen);
+            else
+                SetHotkeyStatus("✗ 註冊失敗：" + _cfg.hotkey + "（可能被其他程式占用，請換一組）", Color.Firebrick);
+
+            if (announce)
+            {
+                if (ok) MessageBox.Show(this, "已套用快捷鍵：" + _cfg.hotkey, "快捷鍵", MessageBoxButtons.OK, MessageBoxIcon.Information);
+                else MessageBox.Show(this, "快捷鍵註冊失敗，可能已被其他程式占用：" + _cfg.hotkey + "\n請改用其他組合（例如 Ctrl+Alt+K、Ctrl+Shift+L）。", "快捷鍵", MessageBoxButtons.OK, MessageBoxIcon.Warning);
+            }
+        }
+
+        private void SetHotkeyStatus(string text, Color color)
+        {
+            if (_hotkeyStatus == null) return;
+            _hotkeyStatus.Text = text;
+            _hotkeyStatus.ForeColor = color;
+        }
+
+        // ---- 快捷鍵錄製：點一下後直接按組合鍵 ----
+        private void BeginHotkeyRecord()
+        {
+            if (_hotkeyRecording) return;
+            _hotkeyRecording = true;
+            _hotkeyBox.Text = "請按下組合鍵…（Esc 取消）";
+            SetHotkeyStatus("錄製中：按住 Ctrl / Alt / Shift 其中至少一個，再按一個鍵", Color.RoyalBlue);
+            _hotkeyBox.Focus();
+        }
+
+        private void CancelHotkeyRecord()
+        {
+            if (!_hotkeyRecording) return;
+            _hotkeyRecording = false;
+            _hotkeyBox.Text = _cfg.hotkey ?? "";
+            RegisterLockHotkey(false);   // 還原狀態列顯示
+        }
+
+        private void HotkeyBox_KeyDown(object sender, KeyEventArgs e)
+        {
+            if (!_hotkeyRecording) return;
+            e.SuppressKeyPress = true;
+            e.Handled = true;
+
+            if (e.KeyCode == Keys.Escape) { CancelHotkeyRecord(); return; }
+
+            // 按到的是修飾鍵本身 → 還在等待主鍵
+            if (e.KeyCode == Keys.ControlKey || e.KeyCode == Keys.ShiftKey || e.KeyCode == Keys.Menu
+                || e.KeyCode == Keys.LWin || e.KeyCode == Keys.RWin)
+            {
+                var pend = ModList(e);
+                SetHotkeyStatus("錄製中：" + (pend.Count > 0 ? string.Join("+", pend.ToArray()) + "+…" : "請按住 Ctrl / Alt / Shift…"), Color.RoyalBlue);
+                return;
+            }
+
+            string key = KeyToString(e.KeyCode);
+            if (key == null)
+            {
+                SetHotkeyStatus("不支援的按鍵，請用 字母 / 數字 / F1–F12", Color.Firebrick);
+                return;
+            }
+            var mods = ModList(e);
+            if (mods.Count == 0)
+            {
+                SetHotkeyStatus("請至少搭配一個 Ctrl / Alt / Shift，避免誤觸", Color.Firebrick);
+                return;
+            }
+
+            string combo = string.Join("+", mods.ToArray()) + "+" + key;
+            _hotkeyBox.Text = combo;
+            _hotkeyRecording = false;
+            Pull();                 // 同步至 _cfg（此時讀到 combo）
+            SaveConfig();
+            RegisterLockHotkey(false);
+        }
+
+        private static List<string> ModList(KeyEventArgs e)
+        {
+            var mods = new List<string>();
+            if (e.Control) mods.Add("Ctrl");
+            if (e.Alt) mods.Add("Alt");
+            if (e.Shift) mods.Add("Shift");
+            return mods;
+        }
+
+        private static string KeyToString(Keys k)
+        {
+            if (k >= Keys.A && k <= Keys.Z) return k.ToString();
+            if (k >= Keys.D0 && k <= Keys.D9) return ((char)('0' + (k - Keys.D0))).ToString();
+            if (k >= Keys.NumPad0 && k <= Keys.NumPad9) return ((char)('0' + (k - Keys.NumPad0))).ToString();
+            if (k >= Keys.F1 && k <= Keys.F12) return k.ToString();
+            return null;
+        }
+
+        protected override void WndProc(ref Message m)
+        {
+            if (m.Msg == NativeMethods.WM_HOTKEY && m.WParam.ToInt32() == HOTKEY_ID)
+            {
+                LockNow();
+                return;
+            }
+            base.WndProc(ref m);
+        }
+
+        // 解析 "Ctrl+Alt+L" → 修飾鍵與虛擬鍵碼
+        private static bool ParseHotkey(string text, out uint mods, out uint vk)
+        {
+            mods = 0; vk = 0;
+            if (string.IsNullOrWhiteSpace(text)) return false;
+            foreach (var raw in text.Split('+'))
+            {
+                string p = raw.Trim().ToLowerInvariant();
+                if (p.Length == 0) continue;
+                switch (p)
+                {
+                    case "ctrl": case "control": mods |= NativeMethods.MOD_CONTROL; break;
+                    case "alt": mods |= NativeMethods.MOD_ALT; break;
+                    case "shift": mods |= NativeMethods.MOD_SHIFT; break;
+                    case "win": case "windows": case "meta": mods |= NativeMethods.MOD_WIN; break;
+                    default:
+                        if (p.Length == 1 && p[0] >= 'a' && p[0] <= 'z') vk = (uint)char.ToUpperInvariant(p[0]);
+                        else if (p.Length == 1 && p[0] >= '0' && p[0] <= '9') vk = (uint)p[0];
+                        else if ((p[0] == 'f') && p.Length <= 3)
+                        {
+                            int n;
+                            if (int.TryParse(p.Substring(1), out n) && n >= 1 && n <= 24) vk = (uint)(0x70 + (n - 1));
+                        }
+                        break;
+                }
+            }
+            return vk != 0 && mods != 0;   // 要求至少一個修飾鍵，避免誤觸
+        }
+
+        // ---- 系統匣 ----
+        private void BuildTray()
+        {
+            var menu = new ContextMenuStrip();
+            menu.Items.Add("開啟設定", null, (s, e) => RestoreFromTray());
+            menu.Items.Add("立即鎖定", null, (s, e) => { RestoreFromTray(); LockNow(); });
+            menu.Items.Add(new ToolStripSeparator());
+            menu.Items.Add("結束", null, (s, e) => { _reallyExit = true; Close(); });
+
+            _tray = new NotifyIcon
+            {
+                Icon = SystemIcons.Shield,
+                Text = "鍵鼠鎖定",
+                Visible = true,
+                ContextMenuStrip = menu
+            };
+            _tray.DoubleClick += (s, e) => RestoreFromTray();
+        }
+
+        private void RestoreFromTray()
+        {
+            Show();
+            WindowState = FormWindowState.Normal;
+            Activate();
+        }
+
+        private void OnFormClosing(object sender, FormClosingEventArgs e)
+        {
+            // 使用者按右上角 X → 縮到系統匣，不結束程式
+            if (!_reallyExit && e.CloseReason == CloseReason.UserClosing)
+            {
+                e.Cancel = true;
+                Hide();
+                _tray.ShowBalloonTip(1500, "鍵鼠鎖定", "已縮到系統匣，右鍵圖示可開設定或鎖定。", ToolTipIcon.Info);
+                return;
+            }
+            if (_hotkeyRegistered && IsHandleCreated)
+            {
+                NativeMethods.UnregisterHotKey(Handle, HOTKEY_ID);
+                _hotkeyRegistered = false;
+            }
+            if (_tray != null) { _tray.Visible = false; _tray.Dispose(); }
+        }
+
+        private static int Clamp(int v, int lo, int hi) { return v < lo ? lo : (v > hi ? hi : v); }
+    }
+
+    // =========================================================================
+    //  進入點
+    // =========================================================================
+    internal static class Program
+    {
+        [STAThread]
+        private static void Main()
+        {
+            // 必須在任何視窗 / 繪圖之前宣告 DPI 感知，截圖與座標才會用實體像素。
+            NativeMethods.EnableDpiAwareness();
+
+            // 單一實例：避免重複鎖定造成鉤子疊加
+            bool createdNew;
+            using (var mutex = new Mutex(true, "KeyMouseLock_SingleInstance", out createdNew))
+            {
+                if (!createdNew) return;
+
+                Application.EnableVisualStyles();
+                Application.SetCompatibleTextRenderingDefault(false);
+
+                string exeDir = Path.GetDirectoryName(Application.ExecutablePath);
+                string cfgPath = Path.Combine(exeDir, "config.json");
+
+                // 主視窗即設定面板（依老爺指示）。鎖定由面板內按鈕或系統匣觸發。
+                Application.Run(new SettingsForm(cfgPath));
+            }
+        }
+    }
+}

@@ -1,0 +1,14 @@
+# ── 個人設定（含密碼雜湊 / 未來的通道憑證）——絕不上傳 ──
+config.json
+
+# ── 編譯產物 ──
+*.exe
+*.pdb
+*.obj
+
+# ── 編輯器 / 系統 ──
+.vs/
+.idea/
+Thumbs.db
+desktop.ini
+*~
