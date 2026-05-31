@@ -9,6 +9,11 @@ DESIGN.md
 *.pdb
 *.obj
 
+# ── 發佈流程暫存產物（由 GitHub Actions 產生）──
+release-body.md
+dist/
+StillGuard-*.zip
+
 # ── 編輯器 / 系統 ──
 .vs/
 .idea/
