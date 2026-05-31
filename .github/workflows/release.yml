@@ -1,0 +1,41 @@
+name: Build and Release
+
+# 當推送 v 開頭的標籤（例如 v1.0.0）時觸發
+on:
+  push:
+    tags:
+      - 'v*'
+
+permissions:
+  contents: write   # 允許建立 Release
+
+jobs:
+  build-release:
+    runs-on: windows-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Build StillGuard.exe
+        shell: cmd
+        run: call build.bat
+
+      - name: Package zip
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force dist | Out-Null
+          Copy-Item StillGuard.exe dist\
+          Copy-Item README.md dist\
+          Copy-Item config.example.json dist\
+          Compress-Archive -Path dist\* -DestinationPath "StillGuard-${{ github.ref_name }}.zip" -Force
+
+      - name: Create GitHub Release
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: >
+          gh release create "${{ github.ref_name }}"
+          "StillGuard.exe"
+          "StillGuard-${{ github.ref_name }}.zip"
+          --title "StillGuard ${{ github.ref_name }}"
+          --notes "自動建置發佈。直接下載 StillGuard.exe 執行即可（首次啟動請先設定主密碼）；或下載 zip（含 README 與設定範例）。"
