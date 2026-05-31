@@ -1,5 +1,5 @@
 // =============================================================================
-//  KeyMouseLock — 鍵鼠鎖定工具
+//  StillGuard（靜守）— 鍵鼠鎖定工具
 //  依 DESIGN.md v1.0 實作。C# + WinForms，目標 .NET Framework 4.x。
 //  以 Windows 內建 csc.exe 編譯為單一 exe（見 build.bat）。
 //
@@ -23,7 +23,7 @@ using System.Threading;
 using System.Web.Script.Serialization;   // System.Web.Extensions.dll
 using System.Windows.Forms;
 
-namespace KeyMouseLock
+namespace StillGuard
 {
     // =========================================================================
     //  密碼策略（第 7 節，公開友善版）
@@ -1203,7 +1203,7 @@ namespace KeyMouseLock
             _otpLastSent = DateTime.Now;
 
             string code = _otp.Generate();
-            string msg = "【鍵鼠鎖定】一次性解鎖碼：" + code + "（5 分鐘內有效）";
+            string msg = "【StillGuard 靜守】一次性解鎖碼：" + code + "（5 分鐘內有效）";
             _otpHint = "寄送中…";
             InvalidatePanel();
 
@@ -1546,11 +1546,12 @@ namespace KeyMouseLock
             _cfgPath = cfgPath;
             _cfg = AppConfig.LoadOrDefault(cfgPath);
 
-            Text = "鍵鼠鎖定 — 設定";
+            Text = "StillGuard 靜守 — 設定";
             StartPosition = FormStartPosition.CenterScreen;
             ClientSize = new Size(940, 620);
             MinimumSize = new Size(900, 600);
             Font = new Font("Segoe UI", 9f);
+            try { Icon = AppIcon.Load(); } catch { }
 
             BuildUi();
             BindFromConfig();
@@ -1909,7 +1910,7 @@ namespace KeyMouseLock
             {
                 INotifier n = NotifierFactory.Create(o);
                 string err = "通道建立失敗";
-                bool ok = (n != null) && n.Send("【鍵鼠鎖定】測試訊息：若你收到這則，代表 OTP 通道設定成功。", out err);
+                bool ok = (n != null) && n.Send("【StillGuard 靜守】測試訊息：若你收到這則，代表 OTP 通道設定成功。", out err);
                 string msg = ok ? "測試訊息已寄出，請查看你的裝置。" : ("寄送失敗：" + (err ?? "未知錯誤"));
                 try { BeginInvoke((MethodInvoker)(() => { _otpStatus.Text = msg; _otpStatus.ForeColor = ok ? Color.SeaGreen : Color.Firebrick; })); } catch { }
             });
@@ -2175,8 +2176,8 @@ namespace KeyMouseLock
 
             _tray = new NotifyIcon
             {
-                Icon = SystemIcons.Shield,
-                Text = "鍵鼠鎖定",
+                Icon = Icon ?? SystemIcons.Shield,   // 與視窗圖示一致
+                Text = "StillGuard 靜守",
                 Visible = true,
                 ContextMenuStrip = menu
             };
@@ -2197,7 +2198,7 @@ namespace KeyMouseLock
             {
                 e.Cancel = true;
                 Hide();
-                _tray.ShowBalloonTip(1500, "鍵鼠鎖定", "已縮到系統匣，右鍵圖示可開設定或鎖定。", ToolTipIcon.Info);
+                _tray.ShowBalloonTip(1500, "StillGuard 靜守", "已縮到系統匣，右鍵圖示可開設定或鎖定。", ToolTipIcon.Info);
                 return;
             }
             if (_hotkeyRegistered && IsHandleCreated)
@@ -2209,6 +2210,31 @@ namespace KeyMouseLock
         }
 
         private static int Clamp(int v, int lo, int hi) { return v < lo ? lo : (v > hi ? hi : v); }
+    }
+
+    // =========================================================================
+    //  應用程式圖示載入：優先 exe 旁的 icon.ico（可隨時換、免重編），
+    //  其次 exe 內嵌圖示（編譯時 /win32icon），最後回退系統盾牌。
+    // =========================================================================
+    internal static class AppIcon
+    {
+        public static Icon Load()
+        {
+            try
+            {
+                string dir = Path.GetDirectoryName(Application.ExecutablePath);
+                string ico = Path.Combine(dir, "icon.ico");
+                if (File.Exists(ico)) return new Icon(ico);
+            }
+            catch { }
+            try
+            {
+                var embedded = Icon.ExtractAssociatedIcon(Application.ExecutablePath);
+                if (embedded != null) return embedded;
+            }
+            catch { }
+            return SystemIcons.Shield;
+        }
     }
 
     // =========================================================================
@@ -2224,7 +2250,7 @@ namespace KeyMouseLock
 
             // 單一實例：避免重複鎖定造成鉤子疊加
             bool createdNew;
-            using (var mutex = new Mutex(true, "KeyMouseLock_SingleInstance", out createdNew))
+            using (var mutex = new Mutex(true, "StillGuard_SingleInstance", out createdNew))
             {
                 if (!createdNew) return;
 

@@ -1,4 +1,4 @@
-# KeyMouseLock — 鍵鼠鎖定工具
+# StillGuard（靜守）— 鍵鼠鎖定工具
 
 一支可常駐桌面、隨手觸發的輕量鎖定程式。觸發後封鎖本機鍵盤與滑鼠，
 以類 Windows 鎖屏的雙態介面呈現，輸入正確密碼方可解鎖。
@@ -27,13 +27,13 @@
 build.bat
 ```
 
-成功後產生 `KeyMouseLock.exe`。請將 `config.json` 與 exe 置於 **同一資料夾**。
+成功後產生 `StillGuard.exe`。請將 `config.json` 與 exe 置於 **同一資料夾**。
 
 ---
 
 ## 使用
 
-1. 雙擊 `KeyMouseLock.exe` → 開啟 **設定主視窗**（左側設定、右側即時預覽）。
+1. 雙擊 `StillGuard.exe` → 開啟 **設定主視窗**（左側設定、右側即時預覽）。
 2. 在設定視窗調整背景、模糊、變暗、逾時、是否顯示時鐘，**右側即時預覽**所見即所得。
 3. 按 **「🔒 立即鎖定」** 或系統匣圖示右鍵選「立即鎖定」→ 進入鎖屏。
 4. 鎖屏後按任意鍵或移動滑鼠 → 浮出 **密碼面板**；鍵入密碼按 `Enter` 解鎖。
@@ -62,7 +62,7 @@ build.bat
 
 - 輸入態無操作達 `idleTimeoutSec`（預設 10 秒）會退回閒置態。
 - 鍵鼠全程被鉤子封鎖，實體輸入不會傳入系統。
-- 最壞情況忘記密碼：`Ctrl+Alt+Del` → 工作管理員結束 `KeyMouseLock.exe`。
+- 最壞情況忘記密碼：`Ctrl+Alt+Del` → 工作管理員結束 `StillGuard.exe`。
 
 ---
 
@@ -87,7 +87,7 @@ build.bat
 
 主密碼忘了、又沒設救援碼時：
 
-1. `Ctrl+Alt+Del` → 工作管理員結束 `KeyMouseLock.exe`；
+1. `Ctrl+Alt+Del` → 工作管理員結束 `StillGuard.exe`；
 2. 刪除該機的 `config.json`；
 3. 重新啟動 → 回到「未設定」狀態，重新設定主密碼即可。
 

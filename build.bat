@@ -1,13 +1,13 @@
 @echo off
 REM ===========================================================================
-REM  KeyMouseLock build script
+REM  StillGuard build script
 REM  Uses the built-in csc.exe (.NET Framework 4.x). No SDK required.
-REM  Produces a single KeyMouseLock.exe.
+REM  Produces a single StillGuard.exe.
 REM ===========================================================================
 setlocal enabledelayedexpansion
 
 set "ROOT=%~dp0"
-set "OUT=%ROOT%KeyMouseLock.exe"
+set "OUT=%ROOT%StillGuard.exe"
 set "SRC=%ROOT%LockScreen.cs"
 
 set "CSC="
@@ -19,10 +19,15 @@ if not defined CSC (
   exit /b 1
 )
 
+REM If icon.ico exists in this folder, embed it as the exe file icon
+set "ICONARG="
+if exist "%ROOT%icon.ico" set ICONARG=/win32icon:"%ROOT%icon.ico"
+if defined ICONARG echo Using icon: %ROOT%icon.ico
+
 echo Compiler: !CSC!
 echo Building...
 
-"!CSC!" /nologo /target:winexe /optimize+ /out:"%OUT%" /reference:System.dll /reference:System.Drawing.dll /reference:System.Windows.Forms.dll /reference:System.Web.Extensions.dll /reference:System.Security.dll "%SRC%"
+"!CSC!" /nologo /target:winexe /optimize+ /out:"%OUT%" !ICONARG! /reference:System.dll /reference:System.Drawing.dll /reference:System.Windows.Forms.dll /reference:System.Web.Extensions.dll /reference:System.Security.dll "%SRC%"
 
 if errorlevel 1 (
   echo.
@@ -31,6 +36,6 @@ if errorlevel 1 (
 )
 
 echo.
-echo [DONE] Generated KeyMouseLock.exe
+echo [DONE] Generated StillGuard.exe
 echo Tip: keep config.json next to the exe.
 endlocal
