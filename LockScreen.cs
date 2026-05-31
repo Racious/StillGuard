@@ -1723,10 +1723,29 @@ namespace StillGuard
             // ===== 右側預覽 =====
             var right = new Panel { Dock = DockStyle.Fill, Padding = new Padding(10), BackColor = Color.FromArgb(30, 30, 34) };
             split.Panel2.Controls.Add(right);
-            var previewTitle = new Label { Text = "即時預覽（鎖屏外觀）", Dock = DockStyle.Top, ForeColor = Color.Gainsboro, Height = 22 };
+
+            var previewBar = new Panel { Dock = DockStyle.Top, Height = 30 };
+            var previewTitle = new Label { Text = "即時預覽（鎖屏外觀）", Dock = DockStyle.Left, ForeColor = Color.Gainsboro, AutoSize = true, Padding = new Padding(0, 6, 0, 0) };
+            var refreshBtn = new Button { Text = "重新擷取桌面", Dock = DockStyle.Right, AutoSize = true, FlatStyle = FlatStyle.Flat, ForeColor = Color.Gainsboro };
+            refreshBtn.Click += (s, e) => RecaptureDesktopForPreview();
+            previewBar.Controls.Add(previewTitle);
+            previewBar.Controls.Add(refreshBtn);
+
             _preview = new PreviewPanel { Dock = DockStyle.Fill };
             right.Controls.Add(_preview);
-            right.Controls.Add(previewTitle);
+            right.Controls.Add(previewBar);
+        }
+
+        // 隱藏視窗→擷取當下乾淨桌面→還原，讓預覽反映現況
+        private void RecaptureDesktopForPreview()
+        {
+            Hide();
+            Application.DoEvents();
+            Thread.Sleep(150);
+            _preview.RefreshDesktop();
+            Show();
+            WindowState = FormWindowState.Normal;
+            Activate();
         }
 
         private static Label SectionLabel(string text)
@@ -2186,6 +2205,8 @@ namespace StillGuard
 
         private void RestoreFromTray()
         {
+            // 視窗此刻仍隱藏（桌面乾淨），趁機把預覽更新成當下桌面
+            if (_preview != null && !Visible) { try { _preview.RefreshDesktop(); } catch { } }
             Show();
             WindowState = FormWindowState.Normal;
             Activate();
