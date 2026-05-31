@@ -22,7 +22,7 @@ if not defined CSC (
 echo Compiler: !CSC!
 echo Building...
 
-"!CSC!" /nologo /target:winexe /optimize+ /out:"%OUT%" /reference:System.dll /reference:System.Drawing.dll /reference:System.Windows.Forms.dll /reference:System.Web.Extensions.dll "%SRC%"
+"!CSC!" /nologo /target:winexe /optimize+ /out:"%OUT%" /reference:System.dll /reference:System.Drawing.dll /reference:System.Windows.Forms.dll /reference:System.Web.Extensions.dll /reference:System.Security.dll "%SRC%"
 
 if errorlevel 1 (
   echo.

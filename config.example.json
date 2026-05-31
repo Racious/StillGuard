@@ -1,7 +1,16 @@
 {
-  "_說明": "複製本檔為 config.json 後即可自訂。沒有 config.json 也能執行（使用內建預設值）。密碼請在程式的設定視窗內變更，會以雜湊寫入你自己的 config.json（該檔已被 .gitignore 排除，不會上傳）。",
+  "_說明": "複製本檔為 config.json 後即可自訂。沒有 config.json 也能執行（使用內建預設值）。密碼與 OTP 憑證請在程式的設定視窗內設定，會以雜湊 / DPAPI 加密寫入你自己的 config.json（該檔已被 .gitignore 排除，不會上傳）。otp 區塊一般由設定視窗自動產生，這裡僅示意結構。",
   "background": { "type": "blurDesktop", "blur": 0, "dim": 0.35 },
   "idleTimeoutSec": 10,
   "hotkey": "Ctrl+Shift+L",
-  "showClock": true
+  "showClock": true,
+  "otp": {
+    "enabled": false,
+    "channel": "telegram",
+    "telegramToken": "",
+    "telegramChatId": "",
+    "discordWebhook": "",
+    "ntfyServer": "https://ntfy.sh",
+    "ntfyTopic": ""
+  }
 }

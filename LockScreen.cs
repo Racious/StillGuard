@@ -120,6 +120,189 @@ namespace KeyMouseLock
     }
 
     // =========================================================================
+    //  OTP 一次性救援碼設定（送至手機 / APP）
+    // =========================================================================
+    internal sealed class OtpConfig
+    {
+        public bool enabled = false;
+        public string channel = "telegram";        // telegram | discord | ntfy
+        public string telegramToken = "";          // 機密，DPAPI 加密存放
+        public string telegramChatId = "";
+        public string discordWebhook = "";         // 機密，DPAPI 加密存放
+        public string ntfyServer = "https://ntfy.sh";
+        public string ntfyTopic = "";
+    }
+
+    // 以 Windows DPAPI（當前使用者）加密 / 解密機密字串；存放格式加前綴 "enc:"。
+    internal static class DataProtector
+    {
+        public static string Protect(string plain)
+        {
+            if (string.IsNullOrEmpty(plain)) return "";
+            if (plain.StartsWith("enc:")) return plain;   // 已是加密字串
+            try
+            {
+                byte[] enc = ProtectedData.Protect(Encoding.UTF8.GetBytes(plain), null, DataProtectionScope.CurrentUser);
+                return "enc:" + Convert.ToBase64String(enc);
+            }
+            catch { return plain; }
+        }
+
+        public static string Unprotect(string stored)
+        {
+            if (string.IsNullOrEmpty(stored)) return "";
+            if (!stored.StartsWith("enc:")) return stored;  // 相容明碼
+            try
+            {
+                byte[] enc = Convert.FromBase64String(stored.Substring(4));
+                byte[] data = ProtectedData.Unprotect(enc, null, DataProtectionScope.CurrentUser);
+                return Encoding.UTF8.GetString(data);
+            }
+            catch { return ""; }
+        }
+    }
+
+    // =========================================================================
+    //  通知通道（策略 + 工廠）—— 新增通道 = 新增一個 INotifier + 於工廠註冊
+    // =========================================================================
+    internal interface INotifier
+    {
+        bool Send(string message, out string error);
+    }
+
+    internal sealed class TelegramNotifier : INotifier
+    {
+        private readonly string _token, _chatId;
+        public TelegramNotifier(string token, string chatId) { _token = token; _chatId = chatId; }
+        public bool Send(string message, out string error)
+        {
+            error = null;
+            if (string.IsNullOrEmpty(_token) || string.IsNullOrEmpty(_chatId)) { error = "Telegram token / chatId 未設定"; return false; }
+            try
+            {
+                ServicePointManager.SecurityProtocol = (SecurityProtocolType)3072;
+                using (var wc = new WebClient())
+                {
+                    var data = new System.Collections.Specialized.NameValueCollection();
+                    data["chat_id"] = _chatId;
+                    data["text"] = message;
+                    wc.UploadValues("https://api.telegram.org/bot" + _token + "/sendMessage", data);
+                }
+                return true;
+            }
+            catch (Exception ex) { error = ex.Message; return false; }
+        }
+    }
+
+    internal sealed class DiscordNotifier : INotifier
+    {
+        private readonly string _webhook;
+        public DiscordNotifier(string webhook) { _webhook = webhook; }
+        public bool Send(string message, out string error)
+        {
+            error = null;
+            if (string.IsNullOrEmpty(_webhook)) { error = "Discord webhook 未設定"; return false; }
+            try
+            {
+                ServicePointManager.SecurityProtocol = (SecurityProtocolType)3072;
+                using (var wc = new WebClient())
+                {
+                    wc.Headers[HttpRequestHeader.ContentType] = "application/json";
+                    string json = "{\"content\":\"" + JsonEscape(message) + "\"}";
+                    wc.UploadString(_webhook, "POST", json);
+                }
+                return true;
+            }
+            catch (Exception ex) { error = ex.Message; return false; }
+        }
+        private static string JsonEscape(string s)
+        {
+            return (s ?? "").Replace("\\", "\\\\").Replace("\"", "\\\"").Replace("\n", "\\n").Replace("\r", "");
+        }
+    }
+
+    internal sealed class NtfyNotifier : INotifier
+    {
+        private readonly string _server, _topic;
+        public NtfyNotifier(string server, string topic) { _server = server; _topic = topic; }
+        public bool Send(string message, out string error)
+        {
+            error = null;
+            if (string.IsNullOrEmpty(_topic)) { error = "ntfy 主題未設定"; return false; }
+            try
+            {
+                ServicePointManager.SecurityProtocol = (SecurityProtocolType)3072;
+                string baseUrl = string.IsNullOrEmpty(_server) ? "https://ntfy.sh" : _server.TrimEnd('/');
+                using (var wc = new WebClient())
+                {
+                    wc.Encoding = Encoding.UTF8;
+                    wc.UploadString(baseUrl + "/" + _topic, "POST", message);
+                }
+                return true;
+            }
+            catch (Exception ex) { error = ex.Message; return false; }
+        }
+    }
+
+    internal static class NotifierFactory
+    {
+        // 依設定建立通道（機密欄位於此解密）
+        public static INotifier Create(OtpConfig cfg)
+        {
+            if (cfg == null) return null;
+            switch ((cfg.channel ?? "").ToLowerInvariant())
+            {
+                case "telegram": return new TelegramNotifier(DataProtector.Unprotect(cfg.telegramToken), cfg.telegramChatId);
+                case "discord": return new DiscordNotifier(DataProtector.Unprotect(cfg.discordWebhook));
+                case "ntfy": return new NtfyNotifier(cfg.ntfyServer, cfg.ntfyTopic);
+                default: return null;
+            }
+        }
+
+        public static bool IsConfigured(OtpConfig cfg)
+        {
+            if (cfg == null || !cfg.enabled) return false;
+            switch ((cfg.channel ?? "").ToLowerInvariant())
+            {
+                case "telegram": return !string.IsNullOrEmpty(cfg.telegramToken) && !string.IsNullOrEmpty(cfg.telegramChatId);
+                case "discord": return !string.IsNullOrEmpty(cfg.discordWebhook);
+                case "ntfy": return !string.IsNullOrEmpty(cfg.ntfyTopic);
+                default: return false;
+            }
+        }
+    }
+
+    // OTP 產生與驗證（一次性、限時）
+    internal sealed class OtpState
+    {
+        private string _code;
+        private DateTime _expiry = DateTime.MinValue;
+        private bool _used;
+
+        public int ValiditySeconds = 300;   // 5 分鐘
+
+        public string Generate()
+        {
+            byte[] b = new byte[4];
+            using (var rng = new RNGCryptoServiceProvider()) rng.GetBytes(b);
+            uint v = (uint)(BitConverter.ToUInt32(b, 0) % 1000000);
+            _code = v.ToString("D6");
+            _expiry = DateTime.Now.AddSeconds(ValiditySeconds);
+            _used = false;
+            return _code;
+        }
+
+        public bool Verify(string input)
+        {
+            if (string.IsNullOrEmpty(_code) || _used) return false;
+            if (DateTime.Now > _expiry) return false;
+            if (input != _code) return false;
+            _used = true;   // 一次性
+            return true;
+        }
+    }
+
+    // =========================================================================
     //  設定模型（config.json）
     // =========================================================================
     internal sealed class BackgroundConfig
@@ -150,6 +333,7 @@ namespace KeyMouseLock
         public List<WidgetConfig> widgets = new List<WidgetConfig>();
         public PasswordConfig password = null;   // 主密碼雜湊（由 UI 設定）
         public PasswordConfig rescue = null;     // 救援碼雜湊（可選，由 UI 設定）
+        public OtpConfig otp = new OtpConfig();   // OTP 一次性救援碼通道
 
         public static AppConfig LoadOrDefault(string path)
         {
@@ -187,6 +371,21 @@ namespace KeyMouseLock
 
             cfg.password = ReadPwd(root, "password");
             cfg.rescue = ReadPwd(root, "rescue");
+
+            if (root.ContainsKey("otp") && root["otp"] is Dictionary<string, object>)
+            {
+                var o = (Dictionary<string, object>)root["otp"];
+                cfg.otp = new OtpConfig
+                {
+                    enabled = GetBool(o, "enabled", false),
+                    channel = GetStr(o, "channel", "telegram"),
+                    telegramToken = GetStr(o, "telegramToken", ""),
+                    telegramChatId = GetStr(o, "telegramChatId", ""),
+                    discordWebhook = GetStr(o, "discordWebhook", ""),
+                    ntfyServer = GetStr(o, "ntfyServer", "https://ntfy.sh"),
+                    ntfyTopic = GetStr(o, "ntfyTopic", "")
+                };
+            }
 
             cfg.widgets.Clear();
             if (root.ContainsKey("widgets") && root["widgets"] is System.Collections.IEnumerable)
@@ -227,13 +426,15 @@ namespace KeyMouseLock
                           " },");
             sb.AppendLine("  \"idleTimeoutSec\": " + idleTimeoutSec + ",");
             sb.AppendLine("  \"hotkey\": " + JStr(hotkey) + ",");
-            var pwdLines = new List<string>();
-            if (password != null && !string.IsNullOrEmpty(password.hash)) pwdLines.Add(PwdJson("password", password));
-            if (rescue != null && !string.IsNullOrEmpty(rescue.hash)) pwdLines.Add(PwdJson("rescue", rescue));
+            // showClock 之後的成員（password / rescue / otp），統一處理逗號
+            var members = new List<string>();
+            if (password != null && !string.IsNullOrEmpty(password.hash)) members.Add(PwdJson("password", password));
+            if (rescue != null && !string.IsNullOrEmpty(rescue.hash)) members.Add(PwdJson("rescue", rescue));
+            if (otp != null) members.Add(OtpJson(otp));
 
-            sb.AppendLine("  \"showClock\": " + (showClock ? "true" : "false") + (pwdLines.Count > 0 ? "," : ""));
-            for (int i = 0; i < pwdLines.Count; i++)
-                sb.AppendLine("  " + pwdLines[i] + (i < pwdLines.Count - 1 ? "," : ""));
+            sb.AppendLine("  \"showClock\": " + (showClock ? "true" : "false") + (members.Count > 0 ? "," : ""));
+            for (int i = 0; i < members.Count; i++)
+                sb.AppendLine("  " + members[i] + (i < members.Count - 1 ? "," : ""));
 
             sb.AppendLine("}");
 
@@ -245,6 +446,17 @@ namespace KeyMouseLock
             return "\"" + key + "\": { \"hash\": " + JStr(pc.hash) +
                    ", \"salt\": " + JStr(pc.salt) +
                    ", \"iterations\": " + pc.iterations + " }";
+        }
+
+        private static string OtpJson(OtpConfig o)
+        {
+            return "\"otp\": { \"enabled\": " + (o.enabled ? "true" : "false") +
+                   ", \"channel\": " + JStr(o.channel) +
+                   ", \"telegramToken\": " + JStr(o.telegramToken) +
+                   ", \"telegramChatId\": " + JStr(o.telegramChatId) +
+                   ", \"discordWebhook\": " + JStr(o.discordWebhook) +
+                   ", \"ntfyServer\": " + JStr(o.ntfyServer) +
+                   ", \"ntfyTopic\": " + JStr(o.ntfyTopic) + " }";
         }
 
         private static string JStr(string s)
@@ -655,6 +867,11 @@ namespace KeyMouseLock
         private string _lastMinute = "";
         private readonly System.Windows.Forms.Timer _tick = new System.Windows.Forms.Timer();
 
+        // OTP 一次性救援碼
+        private readonly OtpState _otp = new OtpState();
+        private string _otpHint = "";                 // 鎖屏底部的 OTP 狀態提示
+        private DateTime _otpLastSent = DateTime.MinValue;
+
         // 鉤子
         private IntPtr _kbHook = IntPtr.Zero;
         private IntPtr _msHook = IntPtr.Zero;
@@ -774,11 +991,12 @@ namespace KeyMouseLock
             return new Rectangle(px, py, panelW, panelH);
         }
 
-        // 只重繪密碼面板區域（避免每次按鍵重畫整個全螢幕背景）
+        // 只重繪密碼面板區域（含下方 OTP 提示，避免每次按鍵重畫整個全螢幕背景）
         private void InvalidatePanel()
         {
             var r = GetPanelRect();
-            r.Inflate(8, 8);
+            r.Inflate(12, 12);
+            r.Height += (int)(60 * PanelScale());   // 涵蓋面板下方的 OTP 提示行
             Invalidate(r);
         }
 
@@ -829,6 +1047,18 @@ namespace KeyMouseLock
                 using (var gray = new SolidBrush(Color.FromArgb(180, 200, 200, 200)))
                 using (var fmt = new StringFormat { Alignment = StringAlignment.Center })
                     g.DrawString("Enter 確認 · Backspace 刪除 · Esc 清空", tipFont, gray, panel.Left + panel.Width / 2f, footY, fmt);
+            }
+
+            // OTP 救援提示（僅在已啟用且設定完成時顯示）
+            if (NotifierFactory.IsConfigured(_cfg.otp))
+            {
+                string line = string.IsNullOrEmpty(_otpHint)
+                    ? "忘記密碼？按 F2 將一次性解鎖碼寄到你的裝置"
+                    : _otpHint;
+                using (var f = new Font("Segoe UI", 13 * scale, FontStyle.Regular, GraphicsUnit.Pixel))
+                using (var b = new SolidBrush(Color.FromArgb(200, 150, 200, 255)))
+                using (var fmt = new StringFormat { Alignment = StringAlignment.Center })
+                    g.DrawString(line, f, b, panel.Left + panel.Width / 2f, panel.Bottom + (int)(10 * scale), fmt);
             }
         }
 
@@ -910,11 +1140,19 @@ namespace KeyMouseLock
 
         private void HandleKeyDown(int vk, uint scanCode)
         {
-            const int VK_RETURN = 0x0D, VK_BACK = 0x08, VK_ESCAPE = 0x1B;
+            const int VK_RETURN = 0x0D, VK_BACK = 0x08, VK_ESCAPE = 0x1B, VK_F2 = 0x71;
+
+            // F2：寄送一次性解鎖碼到設定的通道
+            if (vk == VK_F2)
+            {
+                SendOtp();
+                return;
+            }
 
             if (vk == VK_RETURN)
             {
-                if (PasswordManager.Verify(_cfg, _input.ToString()))
+                // 主密碼 / 救援碼 / 一次性碼（OTP）任一相符即解鎖
+                if (PasswordManager.Verify(_cfg, _input.ToString()) || _otp.Verify(_input.ToString()))
                 {
                     Unlock();
                 }
@@ -945,6 +1183,42 @@ namespace KeyMouseLock
                 _input.Append(ch);
                 _showError = false;
             }
+        }
+
+        private void SendOtp()
+        {
+            if (_cfg.otp == null || !NotifierFactory.IsConfigured(_cfg.otp))
+            {
+                _otpHint = "未啟用或未設定 OTP 通道";
+                InvalidatePanel();
+                return;
+            }
+            // 頻率限制：30 秒內不重複寄送
+            if ((DateTime.Now - _otpLastSent).TotalSeconds < 30)
+            {
+                _otpHint = "請稍候再重寄（30 秒內限一次）";
+                InvalidatePanel();
+                return;
+            }
+            _otpLastSent = DateTime.Now;
+
+            string code = _otp.Generate();
+            string msg = "【鍵鼠鎖定】一次性解鎖碼：" + code + "（5 分鐘內有效）";
+            _otpHint = "寄送中…";
+            InvalidatePanel();
+
+            // 網路 I/O 放背景執行緒，不阻塞鉤子
+            var cfgOtp = _cfg.otp;
+            var t = new Thread(() =>
+            {
+                INotifier n = NotifierFactory.Create(cfgOtp);
+                string err = "通道建立失敗";
+                bool ok = (n != null) && n.Send(msg, out err);
+                string hint = ok ? "已寄出，請查看你的裝置（5 分鐘內有效）" : ("寄送失敗：" + (err ?? "未知錯誤"));
+                try { BeginInvoke((MethodInvoker)(() => { _otpHint = hint; InvalidatePanel(); })); } catch { }
+            });
+            t.IsBackground = true;
+            t.Start();
         }
 
         private string TranslateToChar(int vk, uint scanCode)
@@ -1252,6 +1526,10 @@ namespace KeyMouseLock
         private TextBox _rescue1, _rescue2;
         private Label _pwStatus;
         private Label _rescueStatus;
+        private CheckBox _otpEnabled;
+        private ComboBox _otpChannel;
+        private TextBox _tgToken, _tgChatId, _dcWebhook, _ntfyServer, _ntfyTopic;
+        private Label _otpStatus;
         private NotifyIcon _tray;
         private TextBox _hotkeyBox;
         private Label _hotkeyStatus;
@@ -1387,6 +1665,49 @@ namespace KeyMouseLock
             _rescueStatus = new Label { AutoSize = true, ForeColor = Color.DimGray, Margin = new Padding(3, 4, 3, 8) };
             left.Controls.Add(_rescueStatus);
 
+            // ── OTP 一次性救援碼（送至手機 / APP）──
+            left.Controls.Add(SectionLabel("OTP 一次性救援碼（送至手機 / APP）"));
+            _otpEnabled = new CheckBox { Text = "啟用 OTP 救援（鎖屏按 F2 寄送一次性碼）", AutoSize = true, Margin = new Padding(3, 4, 3, 4) };
+            left.Controls.Add(_otpEnabled);
+
+            var otpPanel = new TableLayoutPanel { ColumnCount = 2, AutoSize = true, Dock = DockStyle.Top };
+            otpPanel.Controls.Add(new Label { Text = "通道", AutoSize = true, Anchor = AnchorStyles.Left, Margin = new Padding(3, 7, 3, 3) }, 0, 0);
+            _otpChannel = new ComboBox { DropDownStyle = ComboBoxStyle.DropDownList, Width = 160 };
+            _otpChannel.Items.AddRange(new object[] { "telegram", "discord", "ntfy" });
+            _otpChannel.SelectedIndexChanged += (s, e) => UpdateOtpFieldVisibility();
+            otpPanel.Controls.Add(_otpChannel, 1, 0);
+
+            otpPanel.Controls.Add(new Label { Text = "Telegram Token", AutoSize = true, Anchor = AnchorStyles.Left, Margin = new Padding(3, 7, 3, 3) }, 0, 1);
+            _tgToken = new TextBox { Width = 260, UseSystemPasswordChar = true };
+            otpPanel.Controls.Add(_tgToken, 1, 1);
+            otpPanel.Controls.Add(new Label { Text = "Telegram ChatId", AutoSize = true, Anchor = AnchorStyles.Left, Margin = new Padding(3, 7, 3, 3) }, 0, 2);
+            _tgChatId = new TextBox { Width = 260 };
+            otpPanel.Controls.Add(_tgChatId, 1, 2);
+
+            otpPanel.Controls.Add(new Label { Text = "Discord Webhook", AutoSize = true, Anchor = AnchorStyles.Left, Margin = new Padding(3, 7, 3, 3) }, 0, 3);
+            _dcWebhook = new TextBox { Width = 260, UseSystemPasswordChar = true };
+            otpPanel.Controls.Add(_dcWebhook, 1, 3);
+
+            otpPanel.Controls.Add(new Label { Text = "ntfy 伺服器", AutoSize = true, Anchor = AnchorStyles.Left, Margin = new Padding(3, 7, 3, 3) }, 0, 4);
+            _ntfyServer = new TextBox { Width = 260 };
+            otpPanel.Controls.Add(_ntfyServer, 1, 4);
+            otpPanel.Controls.Add(new Label { Text = "ntfy 主題", AutoSize = true, Anchor = AnchorStyles.Left, Margin = new Padding(3, 7, 3, 3) }, 0, 5);
+            _ntfyTopic = new TextBox { Width = 260 };
+            otpPanel.Controls.Add(_ntfyTopic, 1, 5);
+
+            var otpBtns = new FlowLayoutPanel { AutoSize = true };
+            var otpApply = new Button { Text = "套用 OTP 設定", AutoSize = true };
+            otpApply.Click += ApplyOtp;
+            var otpTest = new Button { Text = "測試寄送", AutoSize = true };
+            otpTest.Click += TestOtp;
+            otpBtns.Controls.Add(otpApply);
+            otpBtns.Controls.Add(otpTest);
+            otpPanel.Controls.Add(otpBtns, 1, 6);
+            left.Controls.Add(otpPanel);
+
+            _otpStatus = new Label { AutoSize = true, ForeColor = Color.DimGray, Margin = new Padding(3, 4, 3, 8), MaximumSize = new Size(420, 0) };
+            left.Controls.Add(_otpStatus);
+
             // 底部按鈕列
             var buttons = new FlowLayoutPanel { Dock = DockStyle.Bottom, FlowDirection = FlowDirection.RightToLeft, Height = 48, Padding = new Padding(8) };
             var lockBtn = new Button { Text = "🔒 立即鎖定", AutoSize = true, Height = 32, BackColor = Color.FromArgb(40, 90, 160), ForeColor = Color.White, FlatStyle = FlatStyle.Flat };
@@ -1436,6 +1757,19 @@ namespace KeyMouseLock
                 _hotkeyBox.Text = string.IsNullOrWhiteSpace(_cfg.hotkey) ? "" : _cfg.hotkey;
 
                 _showClock.Checked = _cfg.showClock;
+
+                var o = _cfg.otp ?? new OtpConfig();
+                _otpEnabled.Checked = o.enabled;
+                _otpChannel.SelectedItem = (o.channel == "discord" || o.channel == "ntfy") ? o.channel : "telegram";
+                if (_otpChannel.SelectedItem == null) _otpChannel.SelectedIndex = 0;
+                _tgToken.Text = DataProtector.Unprotect(o.telegramToken);     // 顯示明碼供編輯
+                _tgChatId.Text = o.telegramChatId ?? "";
+                _dcWebhook.Text = DataProtector.Unprotect(o.discordWebhook);
+                _ntfyServer.Text = string.IsNullOrEmpty(o.ntfyServer) ? "https://ntfy.sh" : o.ntfyServer;
+                _ntfyTopic.Text = o.ntfyTopic ?? "";
+                UpdateOtpFieldVisibility();
+                RefreshOtpStatus();
+
                 RefreshPwdStatus();
             }
             finally { _binding = false; }
@@ -1529,6 +1863,75 @@ namespace KeyMouseLock
             MessageBox.Show(this, "救援碼已清除。", "救援碼", MessageBoxButtons.OK, MessageBoxIcon.Information);
         }
 
+        // 依選擇的通道，只啟用該通道需要的欄位
+        private void UpdateOtpFieldVisibility()
+        {
+            string ch = _otpChannel.SelectedItem != null ? _otpChannel.SelectedItem.ToString() : "telegram";
+            bool tg = ch == "telegram", dc = ch == "discord", nt = ch == "ntfy";
+            _tgToken.Enabled = tg; _tgChatId.Enabled = tg;
+            _dcWebhook.Enabled = dc;
+            _ntfyServer.Enabled = nt; _ntfyTopic.Enabled = nt;
+        }
+
+        // 從 UI 收集 OTP 設定到一個 OtpConfig（機密欄位加密）
+        private OtpConfig CollectOtp()
+        {
+            return new OtpConfig
+            {
+                enabled = _otpEnabled.Checked,
+                channel = _otpChannel.SelectedItem != null ? _otpChannel.SelectedItem.ToString() : "telegram",
+                telegramToken = DataProtector.Protect(_tgToken.Text.Trim()),
+                telegramChatId = _tgChatId.Text.Trim(),
+                discordWebhook = DataProtector.Protect(_dcWebhook.Text.Trim()),
+                ntfyServer = string.IsNullOrWhiteSpace(_ntfyServer.Text) ? "https://ntfy.sh" : _ntfyServer.Text.Trim(),
+                ntfyTopic = _ntfyTopic.Text.Trim()
+            };
+        }
+
+        private void ApplyOtp(object sender, EventArgs e)
+        {
+            _cfg.otp = CollectOtp();
+            SaveConfig();
+            RefreshOtpStatus();
+            MessageBox.Show(this, "OTP 設定已儲存（機密以 DPAPI 加密存放於本機）。", "OTP", MessageBoxButtons.OK, MessageBoxIcon.Information);
+        }
+
+        private void TestOtp(object sender, EventArgs e)
+        {
+            var o = CollectOtp();
+            if (!NotifierFactory.IsConfigured(o))
+            {
+                MessageBox.Show(this, "尚未填妥所選通道的必要欄位。", "測試寄送", MessageBoxButtons.OK, MessageBoxIcon.Warning);
+                return;
+            }
+            _otpStatus.Text = "測試寄送中…";
+            var t = new Thread(() =>
+            {
+                INotifier n = NotifierFactory.Create(o);
+                string err = "通道建立失敗";
+                bool ok = (n != null) && n.Send("【鍵鼠鎖定】測試訊息：若你收到這則，代表 OTP 通道設定成功。", out err);
+                string msg = ok ? "測試訊息已寄出，請查看你的裝置。" : ("寄送失敗：" + (err ?? "未知錯誤"));
+                try { BeginInvoke((MethodInvoker)(() => { _otpStatus.Text = msg; _otpStatus.ForeColor = ok ? Color.SeaGreen : Color.Firebrick; })); } catch { }
+            });
+            t.IsBackground = true;
+            t.Start();
+        }
+
+        private void RefreshOtpStatus()
+        {
+            if (_otpStatus == null) return;
+            if (NotifierFactory.IsConfigured(_cfg.otp))
+            {
+                _otpStatus.Text = "目前：OTP 已啟用（通道 " + _cfg.otp.channel + "）。";
+                _otpStatus.ForeColor = Color.SeaGreen;
+            }
+            else
+            {
+                _otpStatus.Text = "目前：OTP 未啟用或未設定完整。";
+                _otpStatus.ForeColor = Color.DimGray;
+            }
+        }
+
         private void RefreshPwdStatus()
         {
             if (_pwStatus != null)
@@ -1567,6 +1970,9 @@ namespace KeyMouseLock
                 return;
             }
 
+            // 記住鎖定前設定視窗的狀態：若原本縮在系統匣（隱藏），解鎖後應維持隱藏，不該自動跳出。
+            bool wasVisible = Visible && WindowState != FormWindowState.Minimized;
+
             _isLocking = true;
             Pull();
             SaveConfig();
@@ -1583,12 +1989,18 @@ namespace KeyMouseLock
             {
                 _isLocking = false;
                 _lockCooldownUntil = DateTime.Now.AddMilliseconds(800);
-                Show();
-                WindowState = FormWindowState.Normal;
-                Activate();
-                // 清除焦點：避免解鎖殘留的 Enter 落到「立即鎖定」鈕而再次鎖定。
-                ActiveControl = null;
-                _preview.RefreshDesktop();
+
+                if (wasVisible)
+                {
+                    // 原本開著設定視窗 → 解鎖後回到設定視窗
+                    Show();
+                    WindowState = FormWindowState.Normal;
+                    Activate();
+                    // 清除焦點：避免解鎖殘留的 Enter 落到「立即鎖定」鈕而再次鎖定。
+                    ActiveControl = null;
+                    _preview.RefreshDesktop();
+                }
+                // 原本縮在系統匣 → 維持隱藏，解鎖後乖乖回托盤，不打擾老爺。
             }
         }
 
