@@ -275,6 +275,7 @@ namespace StillGuard
     // OTP 產生與驗證（一次性、限時）
     internal sealed class OtpState
     {
+        private readonly object _lock = new object();   // Generate（UI 緒）與 Verify（輪詢緒）可能並行
         private string _code;
         private DateTime _expiry = DateTime.MinValue;
         private bool _used;
@@ -286,19 +287,25 @@ namespace StillGuard
             byte[] b = new byte[4];
             using (var rng = new RNGCryptoServiceProvider()) rng.GetBytes(b);
             uint v = (uint)(BitConverter.ToUInt32(b, 0) % 1000000);
-            _code = v.ToString("D6");
-            _expiry = DateTime.Now.AddSeconds(ValiditySeconds);
-            _used = false;
-            return _code;
+            lock (_lock)
+            {
+                _code = v.ToString("D6");
+                _expiry = DateTime.Now.AddSeconds(ValiditySeconds);
+                _used = false;
+                return _code;
+            }
         }
 
         public bool Verify(string input)
         {
-            if (string.IsNullOrEmpty(_code) || _used) return false;
-            if (DateTime.Now > _expiry) return false;
-            if (input != _code) return false;
-            _used = true;   // 一次性
-            return true;
+            lock (_lock)
+            {
+                if (string.IsNullOrEmpty(_code) || _used) return false;
+                if (DateTime.Now > _expiry) return false;
+                if (input != _code) return false;
+                _used = true;   // 一次性
+                return true;
+            }
         }
     }
 
@@ -330,6 +337,7 @@ namespace StillGuard
         public int idleTimeoutSec = 10;
         public string hotkey = "Ctrl+Alt+L";      // 全域鎖定快捷鍵
         public bool showClock = true;             // 鎖屏是否顯示內建時鐘
+        public bool showTerminal = false;         // 鎖屏是否顯示駭客終端特效（純裝飾）
         public List<WidgetConfig> widgets = new List<WidgetConfig>();
         public PasswordConfig password = null;   // 主密碼雜湊（由 UI 設定）
         public PasswordConfig rescue = null;     // 救援碼雜湊（可選，由 UI 設定）
@@ -368,6 +376,7 @@ namespace StillGuard
             cfg.idleTimeoutSec = GetInt(root, "idleTimeoutSec", cfg.idleTimeoutSec);
             cfg.hotkey = GetStr(root, "hotkey", cfg.hotkey);
             cfg.showClock = GetBool(root, "showClock", cfg.showClock);
+            cfg.showTerminal = GetBool(root, "showTerminal", cfg.showTerminal);
 
             cfg.password = ReadPwd(root, "password");
             cfg.rescue = ReadPwd(root, "rescue");
@@ -432,7 +441,8 @@ namespace StillGuard
             if (rescue != null && !string.IsNullOrEmpty(rescue.hash)) members.Add(PwdJson("rescue", rescue));
             if (otp != null) members.Add(OtpJson(otp));
 
-            sb.AppendLine("  \"showClock\": " + (showClock ? "true" : "false") + (members.Count > 0 ? "," : ""));
+            sb.AppendLine("  \"showClock\": " + (showClock ? "true" : "false") + ",");
+            sb.AppendLine("  \"showTerminal\": " + (showTerminal ? "true" : "false") + (members.Count > 0 ? "," : ""));
             for (int i = 0; i < members.Count; i++)
                 sb.AppendLine("  " + members[i] + (i < members.Count - 1 ? "," : ""));
 
@@ -665,6 +675,1013 @@ namespace StillGuard
         }
     }
 
+    // 駭客終端特效：程式即時生成的綠字假指令，不停滾動（純裝飾，不影響安全）。
+    internal sealed class FakeTerminal
+    {
+        // kind: 0 一般(暗綠) 1 成功(亮綠) 2 資訊(青) 3 警告(黃) 4 錯誤(紅) 5 進度
+        private sealed class Line { public string Text; public int Kind; }
+        private sealed class Cmd { public bool Progress; public bool Instant; public bool Spin; public int Pause; public string Text; public int Kind; public string Label; }
+
+        private readonly List<Line> _lines = new List<Line>();
+        private readonly Queue<Cmd> _queue = new Queue<Cmd>();
+        private readonly Random _rng = new Random();
+        private int _frame;
+        private int _cols = 80;        // 每行可容字元數（依螢幕寬度動態設定）
+        private int _pauseLeft;        // 停頓剩餘 tick（製造讀取等待感）
+
+        private string _typing;        // 正在打字的整行
+        private int _typed;            // 已打出的字元數
+        private int _typingKind;
+        private bool _inProg;          // 進度條進行中
+        private int _prog;
+        private string _progLabel = "";
+        private int _progStyle;        // 進度條樣式（每次隨機切換，避免單調）
+
+        private bool _inSpin;          // spinner 旋轉等待中
+        private int _spinLeft;         // 旋轉剩餘 tick，歸零後定版為 [ OK ]
+        private string _spinText = "";
+
+        public FakeTerminal() { EnqueueBanner(); }
+
+        // 由外部依終端區寬度與字寬設定每行可容字元數
+        public void SetCols(int cols) { if (cols > 24) _cols = cols; }
+
+        public void Step()
+        {
+            _frame++;
+
+            if (_pauseLeft > 0) { _pauseLeft--; return; }   // 讀取等待停頓（游標仍閃）
+
+            if (_typing != null)                       // 逐字打字（少用，營造「輸入指令」感）
+            {
+                _typed += _rng.Next(2, 6);
+                if (_typed >= _typing.Length) { Commit(_typing, _typingKind); _typing = null; }
+                return;
+            }
+            if (_inProg)                               // 進度條原地成長（唯一的「等待%」慢節奏）
+            {
+                _prog += _rng.Next(4, 16);
+                if (_prog >= 100) _prog = 100;
+                _lines[_lines.Count - 1].Text = ProgressText(_prog);
+                if (_prog >= 100) { _inProg = false; if (_rng.Next(2) == 0) _pauseLeft = _rng.Next(5, 14); }
+                else if (_rng.Next(7) == 0) _pauseLeft = _rng.Next(3, 10);   // 偶爾卡在某 %，像在等回應
+                return;
+            }
+            if (_inSpin)                               // spinner 原地旋轉（取代生硬的死等）
+            {
+                _spinLeft--;
+                if (_spinLeft <= 0)
+                {
+                    _inSpin = false;
+                    _lines[_lines.Count - 1].Text = "  [  OK  ]  " + _spinText;
+                    _lines[_lines.Count - 1].Kind = 1;
+                    if (_rng.Next(3) == 0) _pauseLeft = _rng.Next(4, 12);
+                }
+                else _lines[_lines.Count - 1].Text = SpinLine(SpinFrames[(_frame / 2) % SpinFrames.Length]);
+                return;
+            }
+            if (_queue.Count == 0) Enqueue();          // 取下一個劇情步驟
+            var s = _queue.Dequeue();
+            if (s.Spin) { _inSpin = true; _spinLeft = s.Pause; _spinText = s.Text; Commit(SpinLine(SpinFrames[0]), 2); return; }
+            if (s.Pause > 0) { _pauseLeft = s.Pause; return; }
+            if (s.Instant) { Commit(s.Text, s.Kind); return; }   // 資料狂跑：直接刷出，不逐字
+            if (s.Progress) { _inProg = true; _prog = 0; _progLabel = s.Label; _progStyle = _rng.Next(3); Commit(ProgressText(0), 5); }
+            else { _typing = s.Text; _typed = 0; _typingKind = s.Kind; }
+        }
+
+        private void Commit(string t, int k)
+        {
+            _lines.Add(new Line { Text = t, Kind = k });
+            while (_lines.Count > 80) _lines.RemoveAt(0);
+        }
+
+        private string ProgressText(int p)
+        {
+            int n = 30, f = p * n / 100;
+            switch (_progStyle)
+            {
+                case 1:   // 流動實心方塊
+                    return "  " + new string('▰', f) + new string('▱', n - f) + "  " + p.ToString().PadLeft(3) + "%  " + _progLabel;
+                case 2:   // 軌道 + 旋轉箭頭，到 100% 收尾
+                {
+                    bool done = p >= 100;
+                    string head = done ? "" : SpinFrames[(_frame / 2) % SpinFrames.Length];
+                    int tail = Math.Max(0, n - f - (done ? 0 : 1));
+                    return "  " + new string('━', f) + head + new string('·', tail) + "  " + p.ToString().PadLeft(3) + "%  " + _progLabel;
+                }
+                default:  // 經典 [####----]
+                    return "  [" + new string('#', f) + new string('-', n - f) + "] " + p.ToString().PadLeft(3) + "%  " + _progLabel;
+            }
+        }
+
+        // spinner 旋轉動畫的影格與單行組裝
+        private static readonly string[] SpinFrames = { "⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏" };
+        private string SpinLine(string frame) { return "   " + frame + "   " + _spinText; }
+        private void QS(string label) { _queue.Enqueue(new Cmd { Spin = true, Pause = _rng.Next(18, 40), Text = label }); }
+
+        private void Q(int kind, string text) { _queue.Enqueue(new Cmd { Instant = true, Text = text, Kind = kind }); }
+        private void QP(string label) { _queue.Enqueue(new Cmd { Progress = true, Label = label }); }
+        private void QI(int kind, string text) { _queue.Enqueue(new Cmd { Instant = true, Text = text, Kind = kind }); }
+
+        // 多組開場 ASCII LOGO（每次鎖屏隨機挑一組，像 Spring Boot / CLI 工具啟動）
+        private static readonly string[][] Logos =
+        {
+            new[]
+            {
+                @" ____ _   _ _ _  ____                     _ ",
+                @"/ ___| |_(_) | |/ ___|_   _  __ _ _ __ __| |",
+                @"\___ \ __| | | | |  _| | | |/ _` | '__/ _` |",
+                @" ___) | |_| | | | |_| | |_| | (_| | | | (_| |",
+                @"|____/ \__|_|_|_|\____|\__,_|\__,_|_|  \__,_|",
+            },
+            new[]
+            {
+                @" ___ _____ ___ _    _    ___ _   _   _   ___ ___  ",
+                @"/ __|_   _|_ _| |  | |  / __| | | | /_\ | _ \   \ ",
+                @"\__ \ | |  | || |__| |__| (_ | |_| |/ _ \|   / |) |",
+                @"|___/ |_| |___|____|____|\___|\___/_/ \_\_|_\___/ ",
+            },
+            new[]
+            {
+                @"╔═══════════════════════════════════════╗",
+                @"║   ▓▓▓  S T I L L G U A R D  ▓▓▓        ║",
+                @"║   ::  secure desktop lock daemon  ::  ║",
+                @"╚═══════════════════════════════════════╝",
+            },
+            new[]
+            {
+                @" __  ___ _ _ _    ___ _  _ _ _ ___ ___ ",
+                @"(_ )|_ _| | | |  /  _) || | /_\ | _ |   \",
+                @" _\ \| || | | |_| (_ | || |/ _ \|   | |) )",
+                @"(___/|_||_|_|___|\___|\__/_/ \_\_|_|___/ ",
+            },
+        };
+
+        private void EnqueueBanner()
+        {
+            QI(0, "");
+            foreach (var l in Logos[_rng.Next(Logos.Length)]) QI(10, l);  // 隨機一組 LOGO（品牌橙）
+            QI(0, "");
+            QI(8, "    secure desktop lock daemon   ·   v1.0");
+            QI(9, "    " + new string('─', 40));
+            QI(0, "");
+            QS("booting StillGuard sentinel");           // spinner 旋轉等待
+            QI(1, "[  OK  ] kernel guard module loaded");
+            QI(1, "[  OK  ] WH_KEYBOARD_LL / WH_MOUSE_LL hooks engaged");
+            QI(1, "[  OK  ] crypto core ready (AES-256-GCM)");
+            QS("arming sentinel");
+            QI(1, "[+] sentinel ONLINE — monitoring input devices");
+            QI(0, "");
+        }
+
+        private void QW(int ticks) { _queue.Enqueue(new Cmd { Pause = ticks }); }
+
+        // 把多行內容包進對齊的方框
+        private string[] BuildBox(string[] inner)
+        {
+            int w = 0;
+            foreach (var s in inner) if (s.Length > w) w = s.Length;
+            var outp = new List<string>();
+            outp.Add("╔═" + new string('═', w) + "═╗");
+            foreach (var s in inner) outp.Add("║ " + s.PadRight(w) + " ║");
+            outp.Add("╚═" + new string('═', w) + "═╝");
+            return outp.ToArray();
+        }
+
+        // 一行 hex dump（長行，填滿右側）
+        private string HexDump()
+        {
+            // 位元組數依行寬動態調整，讓 hex dump 鋪滿右側（每 byte 約 4 字元 + 位址 12 + 邊框）
+            int n = Math.Max(8, Math.Min(48, (_cols - 16) / 4));
+            var sb = new StringBuilder();
+            sb.Append("0x").Append(Hex(4)).Append("  ");
+            var ascii = new StringBuilder();
+            for (int i = 0; i < n; i++)
+            {
+                int b = _rng.Next(0, 256);
+                sb.Append(b.ToString("X2")).Append((i % 8 == 7) ? "  " : " ");
+                ascii.Append((b >= 32 && b < 127) ? (char)b : '.');
+            }
+            sb.Append(" |").Append(ascii).Append('|');
+            return sb.ToString();
+        }
+
+        // 一個埠掃描表格（box-drawing 對齊）
+        private string[] BuildPortTable()
+        {
+            string[][] rows =
+            {
+                new[]{ "22",   "open",     "ssh    OpenSSH_8.9" },
+                new[]{ "80",   "open",     "http   nginx/1.25" },
+                new[]{ "443",  "open",     "https  TLS1.3" },
+                new[]{ "3306", "filtered", "mysql" },
+                new[]{ "8080", "open",     "http-proxy" },
+            };
+            int c0 = 5, c1 = 9, c2 = 22;
+            var L = new List<string>();
+            L.Add("┌" + new string('─', c0) + "┬" + new string('─', c1) + "┬" + new string('─', c2) + "┐");
+            L.Add("│" + " PORT".PadRight(c0) + "│" + " STATE".PadRight(c1) + "│" + " SERVICE".PadRight(c2) + "│");
+            L.Add("├" + new string('─', c0) + "┼" + new string('─', c1) + "┼" + new string('─', c2) + "┤");
+            foreach (var r in rows)
+                L.Add("│" + (" " + r[0]).PadRight(c0) + "│" + (" " + r[1]).PadRight(c1) + "│" + (" " + r[2]).PadRight(c2) + "│");
+            L.Add("└" + new string('─', c0) + "┴" + new string('─', c1) + "┴" + new string('─', c2) + "┘");
+            return L.ToArray();
+        }
+
+        private string B64(int len)
+        {
+            const string cs = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+            var sb = new StringBuilder(len);
+            for (int i = 0; i < len; i++) sb.Append(cs[_rng.Next(cs.Length)]);
+            return sb.ToString();
+        }
+
+        // 加權抽取池：畫面豐富型（清單 / 儀表板 / 叢集 / build）與全新圖表型（24~27）
+        // 權重加倍，提高多樣圖表登場頻率，讓畫面更熱鬧、形態更分歧
+        private static readonly int[] BlockPool =
+        {
+            0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11,
+            12, 12, 13, 13, 14, 15, 15, 16, 16,
+            17, 18, 19, 20, 21, 22, 23,
+            24, 24, 25, 25, 26, 26, 27, 27, 28, 29,
+            30, 30, 30,
+        };
+
+        // 把一段連貫的劇情排入佇列（看起來像在執行一件完整任務）
+        // 每次隨機組裝 2~4 個不同「積木段落」，順序 / 長度 / 樣式每次都不同
+        private void Enqueue()
+        {
+            int blocks = _rng.Next(2, 5);
+            int last = -1;
+            for (int b = 0; b < blocks; b++)
+            {
+                int which = BlockPool[_rng.Next(BlockPool.Length)];
+                if (which == last) which = BlockPool[_rng.Next(BlockPool.Length)];   // 避免連續重複，重抽一次
+                last = which;
+                AppendBlock(which);
+            }
+            // 偶爾插入大段資料狂跑或表格，製造節奏變化
+            if (_rng.Next(3) == 0) { foreach (var l in BuildPortTable()) QI(2, l); QI(0, ""); }
+        }
+
+        private void AppendBlock(int which)
+        {
+            string ip = Ip();
+            switch (which)
+            {
+                case 0:
+                    Q(0, "$ nmap -sS -p- -T4 " + ip);
+                    QW(_rng.Next(10, 24));
+                    Q(2, "[*] dispatching SYN probes ...");
+                    QP("scanning " + ip + "/24");
+                    Q(1, "[+] " + _rng.Next(40, 220) + " hosts up   " + _rng.Next(2, 18) + "." + _rng.Next(10, 99) + "s");
+                    DumpBurst(_rng.Next(2, 6));
+                    break;
+                case 1:
+                    Q(0, "$ hydra -l root -P rockyou.txt ssh://" + ip);
+                    Q(2, "[*] loading 14,344,392 entries");
+                    QW(_rng.Next(12, 30));
+                    QP("brute-forcing ssh");
+                    Q(3, "[!] lockout — rotating proxy " + Ip() + " -> " + Ip());
+                    Q(1, "[+] access granted   root:" + Hex(_rng.Next(3, 7)));
+                    break;
+                case 2:
+                    Q(0, "$ ./tunnel --to " + ip + " --enc aes256-gcm");
+                    QS("negotiating handshake");
+                    Q(1, "[+] tunnel up   rtt=" + _rng.Next(8, 90) + "ms");
+                    QP("exfiltrating payload");
+                    DumpBurst(_rng.Next(3, 8));
+                    Q(1, "[+] " + _rng.Next(1, 9) + "." + _rng.Next(0, 9) + " GB out   trace wiped");
+                    break;
+                case 3:
+                    Q(0, "$ cryptsetup luksFormat /dev/vault0");
+                    Q(2, "[*] deriving master key (PBKDF2 · 600000 iters)");
+                    QW(_rng.Next(10, 20));
+                    QP("encrypting volume");
+                    Q(1, "[+] sealed   sha256:" + Hex(_rng.Next(8, 16)));
+                    break;
+                case 4:
+                    Q(0, "$ guard --audit --deep");
+                    Q(2, "[*] scanning " + _rng.Next(200, 9000) + " processes ...");
+                    QW(_rng.Next(8, 16));
+                    Q(4, "[-] anomaly in pid " + _rng.Next(1000, 9999) + " (" + Pick(Procs) + ")");
+                    Q(2, "[*] isolating + terminating ...");
+                    Q(1, "[+] threat neutralized");
+                    break;
+                case 5:
+                    Q(2, "[*] dumping memory region 0x" + Hex(4) + " .. 0x" + Hex(4));
+                    DumpBurst(_rng.Next(6, 14));     // 大量 hex 全速狂刷
+                    break;
+                case 6:
+                    Q(0, "$ make -j8 guard");
+                    for (int i = 0; i < _rng.Next(3, 7); i++)
+                        QI(0, "  CC   " + Pick(SrcFiles) + "   (" + _rng.Next(40, 1800) + " loc)");
+                    QP("linking objects");
+                    Q(1, "[+] build ok   " + _rng.Next(1, 9) + "." + _rng.Next(0, 9) + "s");
+                    break;
+                case 7:     // git clone（寫實）
+                    GitClone();
+                    break;
+                case 8:
+                    Q(0, "$ ./flood --target " + ip + " --threads 5000");
+                    Q(2, "[*] spawning worker pool ...");
+                    QW(_rng.Next(6, 14));
+                    QP("saturating uplink");
+                    Q(1, "[+] " + _rng.Next(40, 990) + "k req/s sustained");
+                    break;
+                case 9:
+                    Q(0, "$ ./miner --algo sha256d");
+                    for (int i = 0; i < _rng.Next(4, 9); i++)
+                        QI(0, "block #" + _rng.Next(800000, 899999) + "  nonce=" + _rng.Next(0, int.MaxValue) + "  " + Hex(_rng.Next(8, 16)));
+                    Q(1, "[+] share accepted  diff=" + _rng.Next(1000, 99999));
+                    break;
+                case 10:
+                    Q(0, "$ mysqldump --all-databases > dump.sql");
+                    Q(2, "[*] reading schema ...");
+                    QW(_rng.Next(6, 12));
+                    for (int i = 0; i < _rng.Next(3, 7); i++)
+                        QI(0, "  -> " + Pick(Tables) + "   " + _rng.Next(100, 9999999).ToString("N0") + " rows");
+                    QP("dumping tables");
+                    Q(1, "[+] " + _rng.Next(1, 40) + ".? GB written");
+                    break;
+                case 11:
+                    QS("aligning satellite uplink");
+                    QP("locking signal");
+                    Q(1, "[+] downlink established  " + _rng.Next(40, 990) + " Mbps");
+                    DumpBurst(_rng.Next(3, 7));
+                    break;
+                case 12:    // 檔案列表（ls -la 風）
+                    DirListing();
+                    break;
+                case 13:    // systemd 服務清單
+                    ServiceList();
+                    break;
+                case 14:    // 資源儀表板（CPU / MEM 長條圖）
+                    Dashboard();
+                    break;
+                case 15:    // 叢集節點上線
+                    ClusterSync();
+                    break;
+                case 16:    // build 流程
+                    BuildHooks();
+                    break;
+                case 17: NpmInstall(); break;       // npm 安裝（寫實）
+                case 18: DockerBuild(); break;       // docker build（寫實）
+                case 19: AptInstall(); break;        // apt 安裝（寫實）
+                case 20: PingHost(); break;          // ping（寫實）
+                case 21: KubectlPods(); break;       // kubectl get pods（寫實）
+                case 22: PipInstall(); break;        // pip 安裝（寫實）
+                case 23: Dmesg(); break;             // dmesg 核心訊息（寫實）
+                case 24: NetGraph(); break;          // sparkline 流量走勢圖
+                case 25: Histogram(); break;         // 垂直直方圖
+                case 26: HeatMap(); break;           // 熱力圖網格
+                case 27: PieBreakdown(); break;      // 堆疊比例條 + 圖例
+                case 28: LogStream(); break;         // tail -f 日誌串流
+                case 29: GitLog(); break;            // git log --graph 分支線圖
+                case 30: TopMonitor(); break;        // top 全屏進程監控（高資訊密度列表）
+                default:
+                    Q(2, "[*] capturing packets on eth0 ...");
+                    for (int i = 0; i < _rng.Next(4, 11); i++) QI(0, PacketLine());
+                    break;
+            }
+            QI(0, "");   // 段落間空行
+        }
+
+        private static readonly string[] Tables = { "users", "sessions", "auth_tokens", "audit_log", "payments", "keys", "devices", "events" };
+        private static readonly string[] DirNames = { ".git", "assets", "components", "node_modules", "pages", "src", "build", "dist", "config", "static", "store" };
+        private static readonly string[] FileNames = { "index.ts", "package.json", "README.md", "nuxt.config.js", ".gitignore", "tsconfig.json", "yarn.lock", "main.c", "server.py", "config.yaml", "Dockerfile" };
+        private static readonly string[] Svcs = { "sshd", "nginx", "docker", "cron", "systemd-journald", "NetworkManager", "firewalld", "postgresql", "redis", "dbus" };
+
+        // 檔案 / 目錄列出（三種變體：ls -la / du -sh / find），開頭穿插小停頓
+        private void DirListing()
+        {
+            string path = Pick(new[] { "/var/www/app", "/home/user/project", "/opt/guard", "/srv/data" });
+            switch (_rng.Next(3))
+            {
+                case 1:     // du -sh：各目錄大小
+                    Q(0, "$ du -sh " + path + "/*");
+                    QW(_rng.Next(4, 10));
+                    for (int i = 0, dn = _rng.Next(6, 11); i < dn; i++)
+                        QI(0, (_rng.Next(1, 9) + "." + _rng.Next(0, 9) + Pick(new[] { "K", "M", "G" })).PadRight(7) + path + "/" + Pick(DirNames));
+                    break;
+                case 2:     // find：列出檔案路徑
+                    Q(0, "$ find " + path + " -type f -name '*." + Pick(new[] { "ts", "py", "c", "json", "log" }) + "'");
+                    QW(_rng.Next(4, 9));
+                    for (int i = 0, fn = _rng.Next(7, 14); i < fn; i++)
+                        QI(0, path + "/" + Pick(DirNames) + "/" + Pick(FileNames));
+                    break;
+                default:    // ls -la（欄位對齊）
+                    Q(0, "$ ls -la " + path);
+                    QI(0, "total " + _rng.Next(40, 980));
+                    for (int i = 0, n = _rng.Next(7, 14); i < n; i++)
+                    {
+                        bool dir = _rng.Next(3) == 0;
+                        string perm = dir ? "drwxr-xr-x" : "-rw-r--r--";
+                        string size = (dir ? 4096 : _rng.Next(64, 900000)).ToString().PadLeft(8);
+                        string date = Pick(Months) + " " + _rng.Next(1, 28).ToString().PadLeft(2) + " " + _rng.Next(0, 24).ToString("D2") + ":" + _rng.Next(0, 60).ToString("D2");
+                        string name = dir ? Pick(DirNames) : Pick(FileNames);
+                        QI(dir ? 2 : 0, perm + " " + _rng.Next(1, 5) + " root root " + size + " " + date + " " + name);
+                    }
+                    break;
+            }
+        }
+
+        private static readonly string[] SvcDesc = { "OpenSSH server daemon", "Web server", "Container engine", "Job scheduler", "System logging", "Network manager" };
+
+        // 服務 / 進程列出（三種變體：systemctl list / systemctl status / ps aux）
+        private void ServiceList()
+        {
+            switch (_rng.Next(3))
+            {
+                case 1:     // systemctl status：單一服務詳情
+                {
+                    string svc = Pick(Svcs);
+                    bool running = _rng.Next(4) != 0;
+                    Q(0, "$ systemctl status " + svc);
+                    QW(_rng.Next(3, 8));
+                    QI(running ? 1 : 4, "● " + svc + ".service - " + Pick(SvcDesc));
+                    QI(0, "   Loaded: loaded (/lib/systemd/system/" + svc + ".service; enabled)");
+                    QI(running ? 1 : 4, "   Active: " + (running ? "active (running)" : "failed (Result: exit-code)") + " since " + Pick(Months) + " " + _rng.Next(1, 28) + " " + _rng.Next(0, 24).ToString("D2") + ":" + _rng.Next(0, 60).ToString("D2"));
+                    QI(0, " Main PID: " + _rng.Next(300, 9999) + " (" + svc + ")");
+                    QI(0, "    Tasks: " + _rng.Next(1, 40) + " (limit: 4915)");
+                    QI(0, "   Memory: " + _rng.Next(1, 400) + "." + _rng.Next(0, 9) + "M");
+                    QI(2, "   CGroup: /system.slice/" + svc + ".service");
+                    break;
+                }
+                case 2:     // ps aux：進程表（依 CPU 排序）
+                {
+                    Q(0, "$ ps aux --sort=-%cpu | head");
+                    QI(2, "USER       PID %CPU %MEM    VSZ   RSS COMMAND");
+                    for (int i = 0, n = _rng.Next(6, 11); i < n; i++)
+                    {
+                        string user = Pick(new[] { "root", "www-data", "postgres", "user", "redis" }).PadRight(9);
+                        string pid = _rng.Next(100, 9999).ToString().PadLeft(5);
+                        string cpu = (_rng.Next(0, 80) + "." + _rng.Next(0, 9)).PadLeft(4);
+                        string mem = (_rng.Next(0, 20) + "." + _rng.Next(0, 9)).PadLeft(4);
+                        string vsz = _rng.Next(10000, 999999).ToString().PadLeft(7);
+                        string rss = _rng.Next(1000, 99999).ToString().PadLeft(5);
+                        QI(0, user + " " + pid + " " + cpu + " " + mem + " " + vsz + " " + rss + " " + Pick(Svcs));
+                    }
+                    break;
+                }
+                default:    // systemctl list-units（欄位對齊）
+                    Q(0, "$ systemctl list-units --type=service");
+                    QI(2, "  UNIT                      LOAD     ACTIVE    SUB        DESCRIPTION");
+                    for (int i = 0, n = _rng.Next(6, 11); i < n; i++)
+                    {
+                        bool running = _rng.Next(3) != 0;
+                        string svc = Pick(Svcs) + ".service";
+                        QI(running ? 1 : 0, "  " + svc.PadRight(24) + " loaded   " + (running ? "active" : "inactive").PadRight(9) + " " + (running ? "running" : "dead").PadRight(10) + " " + Pick(SvcDesc));
+                    }
+                    break;
+            }
+        }
+
+        // 資源儀表板（兩種變體：system monitor / nvidia-smi），每次隨機增列
+        private void Dashboard()
+        {
+            if (_rng.Next(3) == 0)    // nvidia-smi 風 GPU 表
+            {
+                Q(6, "$ nvidia-smi");
+                QI(9, "  ┌─ NVIDIA-SMI ───────────────────────────────┐");
+                for (int g = 0, gpus = _rng.Next(1, 5); g < gpus; g++)
+                {
+                    int u = _rng.Next(0, 100), t = _rng.Next(35, 88);
+                    QI(u > 85 || t > 80 ? 4 : u > 60 ? 3 : 1, "  GPU" + g + " " + Pick(new[] { "RTX4090", "A100-80G", "H100", "RTX3080" }).PadRight(9) + " " + t + "°C  [" + Bar(u, 18) + "] " + u.ToString().PadLeft(3) + "%  " + (u * _rng.Next(16, 80) / 100) + "G");
+                }
+                QI(9, "  └────────────────────────────────────────────┘");
+                return;
+            }
+
+            QI(8, "  ┌─ system monitor ───────────────────────────┐");
+            for (int c = 0, cores = _rng.Next(4, 9); c < cores; c++)
+            {
+                int p = _rng.Next(0, 100);
+                QI(p > 85 ? 4 : p > 60 ? 3 : 1, "  CPU" + c + " [" + Bar(p, 28) + "] " + p.ToString().PadLeft(3) + "%");
+            }
+            int mp = _rng.Next(30, 95);
+            QI(mp > 85 ? 4 : mp > 65 ? 3 : 1, "  MEM  [" + Bar(mp, 28) + "] " + (mp * 32 / 100) + "." + _rng.Next(0, 9) + "/32 GB");
+            int np = _rng.Next(0, 60);
+            QI(2, "  NET  [" + Bar(np, 28) + "] " + _rng.Next(0, 990) + " Mbps");              // 青
+            // 隨機增列 SWAP / DISK I/O / 溫度，讓每次儀表板都不同
+            if (_rng.Next(2) == 0) { int sp = _rng.Next(0, 40); QI(6, "  SWAP [" + Bar(sp, 28) + "] " + (sp * 8 / 100) + "." + _rng.Next(0, 9) + "/8 GB"); }   // 藍
+            if (_rng.Next(2) == 0) { int dp = _rng.Next(0, 100); QI(7, "  DISK [" + Bar(dp, 28) + "] " + _rng.Next(0, 600) + " MB/s"); }                       // 洋紅
+            if (_rng.Next(2) == 0) { int tp = _rng.Next(35, 92); QI(tp > 80 ? 4 : 10, "  TEMP [" + Bar(tp, 28) + "] " + tp + "°C"); }                          // 橙 / 過熱紅
+            QI(8, "  └────────────────────────────────────────────┘");
+        }
+
+        private static string Bar(int pct, int n)
+        {
+            int f = pct * n / 100;
+            return new string('█', f) + new string('░', n - f);
+        }
+        private static readonly string[] Months = { "Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec" };
+        private static readonly string[] Crates = { "serde", "tokio", "rand", "clap", "regex", "hyper", "anyhow", "log", "syn", "bytes" };
+        private static readonly string[] Chunks = { "main", "vendor", "runtime", "app", "polyfills", "styles", "common" };
+
+        // 叢集節點上線（含偶發掉線 → 重連劇情、延遲統計，穿插停頓）
+        private void ClusterSync()
+        {
+            Q(2, "[*] synchronizing botnet ...");
+            QW(_rng.Next(8, 16));
+            Q(1, "[+] establishing connections " + _rng.Next(800, 1999) + " nodes");
+            for (int i = 0, clusters = _rng.Next(5, 12); i < clusters; i++)
+            {
+                int roll = _rng.Next(8);
+                if (roll == 0)        // 掉線 → 重連
+                {
+                    QI(4, "    Cluster #" + i.ToString("D2") + "  [offline]  — link lost");
+                    QW(_rng.Next(3, 8));
+                    QI(3, "    Cluster #" + i.ToString("D2") + "  [reconnecting] ...");
+                    QI(1, "    Cluster #" + i.ToString("D2") + "  [online]   recovered");
+                }
+                else
+                {
+                    bool booting = roll == 1;
+                    QI(booting ? 3 : 1, "    Cluster #" + i.ToString("D2") + "  (" + _rng.Next(100, 200) + " nodes)  [" + (booting ? "booting" : "online") + "]   rtt=" + _rng.Next(5, 180) + "ms");
+                }
+            }
+            Q(1, "[+] mesh latency avg " + _rng.Next(8, 60) + "ms   throughput " + _rng.Next(1, 40) + "." + _rng.Next(0, 9) + " Gbps");
+            Q(1, "[+] botnet update complete");
+        }
+
+        // build 流程（三種變體：mkinitcpio / webpack / cargo）
+        private void BuildHooks()
+        {
+            switch (_rng.Next(3))
+            {
+                case 1:     // webpack / vite 打包
+                    Q(0, "$ npm run build");
+                    QI(2, "vite v5.0.0 building for production...");
+                    QS("transforming modules");
+                    QI(0, "  dist/index.html                  " + _rng.Next(1, 9) + "." + _rng.Next(0, 9) + " kB");
+                    foreach (var c in Chunks)
+                        if (_rng.Next(3) != 0)
+                            QI(0, "  dist/assets/" + c + "-" + Hex(4).ToLower() + ".js   " + _rng.Next(10, 990) + "." + _rng.Next(0, 9) + " kB │ gzip: " + _rng.Next(3, 300) + "." + _rng.Next(0, 9) + " kB");
+                    QI(1, "✓ built in " + _rng.Next(1, 40) + "." + _rng.Next(0, 9) + "s");
+                    break;
+                case 2:     // cargo build
+                    Q(0, "$ cargo build --release");
+                    for (int i = 0, n = _rng.Next(5, 11); i < n; i++)
+                        QI(0, "   Compiling " + Pick(Crates) + " v" + _rng.Next(0, 3) + "." + _rng.Next(0, 20) + "." + _rng.Next(0, 9));
+                    QS("compiling guard");
+                    QI(1, "    Finished release [optimized] target(s) in " + _rng.Next(4, 90) + "." + _rng.Next(0, 9) + "s");
+                    break;
+                default:    // mkinitcpio 打包 image（原樣）
+                    Q(0, "==> building image  preset: linux");
+                    QW(_rng.Next(6, 12));
+                    foreach (var h in new[] { "base", "udev", "autodetect", "modconf", "block", "keymap", "encrypt", "fsck", "filesystems" })
+                        QI(0, "  -> running build hook [" + h + "]");
+                    if (_rng.Next(2) == 0) QI(3, "==> WARNING: possibly missing firmware for module " + Pick(SrcFiles));
+                    QP("generating initramfs");
+                    Q(1, "[+] image built  " + Hex(8));
+                    break;
+            }
+        }
+
+        private void DumpBurst(int n) { for (int i = 0; i < n; i++) QI(0, HexDump()); }
+
+        private static readonly string[] SrcFiles = { "sentinel.c", "hook.c", "crypto.c", "netfilter.c", "vault.c", "watchdog.c", "ipc.c" };
+
+        // ── 寫實終端積木：日常開發 / 運維會看到的真實輸出（只求「像」） ──────────────
+        private static readonly string[] Repos    = { "acme/core", "acme/api", "vendor/sdk", "infra/platform", "web/dashboard", "ops/pipeline" };
+        private static readonly string[] NpmPkgs  = { "lodash", "react", "webpack", "axios", "express", "typescript", "eslint", "chalk", "vite", "next" };
+        private static readonly string[] Pkgs     = { "nginx", "curl", "git", "htop", "vim", "python3", "nodejs", "redis-server", "postgresql", "build-essential", "tmux", "jq" };
+        private static readonly string[] K8sApps  = { "api", "web", "worker", "redis", "postgres", "nginx", "auth", "billing", "scheduler" };
+        private static readonly string[] PyPkgs   = { "numpy", "pandas", "requests", "flask", "django", "scipy", "torch", "boto3", "pytest", "pydantic" };
+        private string Ver() { return _rng.Next(1, 5) + "." + _rng.Next(0, 20) + "." + _rng.Next(0, 9); }
+
+        private void GitClone()
+        {
+            string repo = Pick(Repos), name = repo.Substring(repo.IndexOf('/') + 1);
+            Q(0, "$ git clone git@github.com:" + repo + ".git");
+            QI(0, "Cloning into '" + name + "'...");
+            int objs = _rng.Next(8000, 42000);
+            QI(0, "remote: Enumerating objects: " + objs + ", done.");
+            QI(0, "remote: Counting objects: 100% (" + objs + "/" + objs + "), done.");
+            int comp = objs / _rng.Next(3, 5);
+            QI(0, "remote: Compressing objects: 100% (" + comp + "/" + comp + "), done.");
+            QP("Receiving objects");
+            QI(1, "Receiving objects: 100% (" + objs + "/" + objs + "), " + _rng.Next(12, 90) + "." + _rng.Next(0, 9) + " MiB | " + _rng.Next(2, 9) + "." + _rng.Next(0, 9) + " MiB/s, done.");
+            int deltas = objs * 2 / 3;
+            QI(0, "Resolving deltas: 100% (" + deltas + "/" + deltas + "), done.");
+        }
+
+        private void NpmInstall()
+        {
+            Q(0, "$ npm install");
+            QS("resolving packages");
+            if (_rng.Next(2) == 0) QI(3, "npm WARN deprecated " + Pick(NpmPkgs) + "@" + Ver() + ": this library is no longer supported");
+            int pkgs = _rng.Next(300, 1600);
+            QI(1, "added " + pkgs + " packages, and audited " + (pkgs + 1) + " packages in " + _rng.Next(4, 40) + "s");
+            QI(0, _rng.Next(40, 200) + " packages are looking for funding");
+            QI(1, "found 0 vulnerabilities");
+        }
+
+        private void DockerBuild()
+        {
+            string img = Pick(Repos) + ":latest";
+            Q(0, "$ docker build -t " + img + " .");
+            int steps = _rng.Next(8, 16);
+            QI(2, "Step " + _rng.Next(3, steps) + "/" + steps + " : RUN " + Pick(new[] { "apt-get update", "npm ci", "pip install -r requirements.txt", "go build ./...", "make" }));
+            QI(0, " ---> Running in " + Hex(6).ToLower());
+            int layers = _rng.Next(4, 9);
+            for (int i = 0; i < layers; i++) QI(1, Hex(6).ToLower() + ": Pull complete");
+            QS("exporting layers");
+            QI(1, "Successfully built " + Hex(6).ToLower());
+            QI(1, "Successfully tagged " + img);
+        }
+
+        private void AptInstall()
+        {
+            var picks = new List<string>();
+            int k = _rng.Next(2, 5);
+            for (int i = 0; i < k; i++) picks.Add(Pick(Pkgs));
+            Q(0, "$ sudo apt-get install -y " + picks[0]);
+            QI(0, "Reading package lists... Done");
+            QI(0, "Building dependency tree... Done");
+            QI(0, "The following NEW packages will be installed:");
+            QI(2, "  " + string.Join(" ", picks));
+            foreach (var p in picks) QI(0, "Unpacking " + p + " (" + Ver() + ") ...");
+            foreach (var p in picks) QI(1, "Setting up " + p + " (" + Ver() + ") ...");
+            QI(0, "Processing triggers for man-db (2.9.4-2) ...");
+        }
+
+        private void PingHost()
+        {
+            string ip = Pick(new[] { "1.1.1.1", "8.8.8.8", Ip(), Ip() });
+            int n = _rng.Next(4, 8);
+            Q(0, "$ ping -c " + n + " " + ip);
+            QI(0, "PING " + ip + " (" + ip + ") 56(84) bytes of data.");
+            for (int i = 1; i <= n; i++)
+                QI(1, "64 bytes from " + ip + ": icmp_seq=" + i + " ttl=" + _rng.Next(48, 64) + " time=" + _rng.Next(1, 80) + "." + _rng.Next(0, 9) + " ms");
+            QI(2, "--- " + ip + " ping statistics ---");
+            QI(0, n + " packets transmitted, " + n + " received, 0% packet loss");
+        }
+
+        private void KubectlPods()
+        {
+            Q(0, "$ kubectl get pods -n " + Pick(new[] { "production", "staging", "default", "kube-system" }));
+            QI(2, "NAME".PadRight(30) + "READY   STATUS      RESTARTS   AGE");
+            int n = _rng.Next(5, 10);
+            for (int i = 0; i < n; i++)
+            {
+                bool ok = _rng.Next(6) != 0;
+                string name = (Pick(K8sApps) + "-" + Hex(3).ToLower() + "-" + Hex(2).ToLower()).PadRight(30);
+                string status = (ok ? "Running" : Pick(new[] { "Pending", "CrashLoopBackOff", "ContainerCreating" })).PadRight(11);
+                QI(ok ? 1 : 3, name + (ok ? "1/1" : "0/1") + "     " + status + " " + _rng.Next(0, 5) + "          " + _rng.Next(1, 30) + Pick(new[] { "d", "h", "m" }));
+            }
+        }
+
+        private void PipInstall()
+        {
+            Q(0, "$ pip install -r requirements.txt");
+            int n = _rng.Next(3, 6);
+            var got = new List<string>();
+            for (int i = 0; i < n; i++)
+            {
+                string p = Pick(PyPkgs);
+                got.Add(p);
+                QI(0, "Collecting " + p + "==" + Ver());
+                QI(0, "  Downloading " + p + "-" + Ver() + "-cp311.whl (" + _rng.Next(1, 80) + "." + _rng.Next(0, 9) + " MB)");
+            }
+            QS("installing collected packages");
+            QI(1, "Successfully installed " + string.Join(" ", got));
+        }
+
+        private void Dmesg()
+        {
+            Q(0, "$ dmesg -w");
+            int n = _rng.Next(5, 10), t = _rng.Next(1000, 9000);
+            for (int i = 0; i < n; i++)
+            {
+                t += _rng.Next(1, 200);
+                string msg = Pick(new[]
+                {
+                    "usb " + _rng.Next(1, 5) + "-" + _rng.Next(1, 9) + ": new high-speed USB device number " + _rng.Next(2, 30),
+                    "EXT4-fs (sda" + _rng.Next(1, 5) + "): mounted filesystem with ordered data mode",
+                    "eth0: link up, 1000 Mbps, full duplex",
+                    "audit: type=1400 apparmor=\"STATUS\" operation=\"profile_load\"",
+                    "CPU" + _rng.Next(0, 8) + ": Core temperature above threshold, cpu clock throttled",
+                    "TCP: request_sock_TCP: Possible SYN flooding on port " + _rng.Next(80, 9000),
+                });
+                int kind = (msg.Contains("throttled") || msg.Contains("flooding")) ? 3 : 0;
+                QI(kind, "[" + (t / 1000) + "." + (t % 1000).ToString("D3") + "] " + msg);
+            }
+        }
+
+        // ── 全新形態圖表：打破「水平長條圖」單一視覺 ──────────────────────────────
+        private static readonly char[] Spark = { '▁', '▂', '▃', '▄', '▅', '▆', '▇', '█' };
+        private static readonly char[] Heat  = { '·', '░', '▒', '▓', '█' };
+
+        // 隨機漫步產生較平滑的走勢曲線（非純雜訊）
+        private string SparkWalk(int n)
+        {
+            var sb = new StringBuilder(n);
+            int v = _rng.Next(0, 8);
+            for (int i = 0; i < n; i++)
+            {
+                v += _rng.Next(-2, 3);
+                if (v < 0) v = 0; else if (v > 7) v = 7;
+                sb.Append(Spark[v]);
+            }
+            return sb.ToString();
+        }
+        private int GraphW(int max) { return Math.Min(max, Math.Max(20, _cols - 16)); }
+
+        // ① sparkline 流量走勢圖
+        private void NetGraph()
+        {
+            Q(6, "$ bmon -p eth0");
+            QI(9, "  ┌─ traffic eth0  (last 60s) ──────────────────┐");
+            int w = GraphW(46);
+            QI(2, "  RX  " + SparkWalk(w) + "  " + _rng.Next(10, 990) + " Mbps");   // 青
+            QI(6, "  TX  " + SparkWalk(w) + "  " + _rng.Next(10, 990) + " Mbps");   // 藍
+            QI(7, "  pps " + SparkWalk(w) + "  " + _rng.Next(1, 99) + "k");         // 洋紅
+            QI(9, "  └────────────────────────────────────────────┘");
+        }
+
+        // ② 垂直直方圖（鐘形分佈感）
+        private void Histogram()
+        {
+            Q(6, "$ guard --latency-histogram");
+            QI(8, "  request latency distribution");
+            int cols = _rng.Next(12, 20);
+            int[] h = new int[cols];
+            for (int i = 0; i < cols; i++)
+            {
+                int bell = (i > cols / 4 && i < cols * 3 / 4) ? _rng.Next(2, 5) : 0;
+                h[i] = Math.Min(8, _rng.Next(0, 5) + bell);
+            }
+            for (int row = 8; row >= 1; row--)
+            {
+                var sb = new StringBuilder("  ");
+                for (int i = 0; i < cols; i++) sb.Append(h[i] >= row ? "█ " : "  ");
+                int rk = row >= 7 ? 4 : row >= 5 ? 3 : 1;   // 熱度漸層：頂紅 → 中黃 → 底綠
+                QI(rk, sb.ToString());
+            }
+            QI(9, "  0   25  50  100 250 500  1s  2s+  (ms)");
+        }
+
+        // ③ 熱力圖網格（7d × 連線密度）
+        private void HeatMap()
+        {
+            Q(6, "$ guard --activity-map");
+            QI(8, "  connection heatmap  (last 7 days)");
+            int w = GraphW(46);
+            string[] days = { "Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun" };
+            for (int d = 0; d < 7; d++)
+            {
+                var sb = new StringBuilder("  " + days[d] + " ");
+                for (int x = 0; x < w; x++) sb.Append(Heat[_rng.Next(0, 5)]);
+                QI(5, sb.ToString());   // teal 網格
+            }
+            QI(9, "      less " + new string(Heat[0], 1) + Heat[1] + Heat[2] + Heat[3] + Heat[4] + " more");
+        }
+
+        // ④ 堆疊比例條 + 圖例
+        private void PieBreakdown()
+        {
+            Q(6, "$ df -h /dev/vault0 | guard-chart");
+            string[] cats = { "system", "data", "logs", "cache", "free" };
+            char[] blk = { '█', '▓', '▒', '░', ' ' };
+            int[] lk = { 6, 1, 3, 7, 9 };   // 圖例分類色：藍 / 綠 / 黃 / 洋紅 / 灰
+            int[] pct = new int[cats.Length];
+            int rem = 100;
+            for (int i = 0; i < cats.Length - 1; i++) { pct[i] = _rng.Next(5, Math.Max(6, rem - (cats.Length - i - 1) * 5)); rem -= pct[i]; }
+            pct[cats.Length - 1] = rem;
+            int barW = GraphW(44);
+            var bar = new StringBuilder("  ");
+            for (int i = 0; i < cats.Length; i++) bar.Append(new string(blk[i], Math.Max(0, pct[i] * barW / 100)));
+            QI(8, "  storage usage  /dev/vault0  (" + _rng.Next(200, 900) + " GB)");
+            QI(8, "  " + bar.ToString().TrimStart().PadRight(barW, blk[cats.Length - 2]));
+            for (int i = 0; i < cats.Length; i++)
+                QI(lk[i], "  " + (blk[i] == ' ' ? '░' : blk[i]) + "  " + cats[i].PadRight(8) + pct[i].ToString().PadLeft(3) + "%");
+        }
+
+        // ⑤ tail -f 日誌串流（HTTP 狀態碼著色）
+        private static readonly string[] LogPaths = { "/", "/api/v1/users", "/login", "/static/app.js", "/health", "/api/v1/orders", "/favicon.ico", "/admin", "/assets/main.css" };
+        private void LogStream()
+        {
+            Q(6, "$ tail -f /var/log/nginx/access.log");
+            int[] codes = { 200, 200, 200, 200, 301, 304, 404, 500, 403 };
+            for (int i = 0, n = _rng.Next(7, 14); i < n; i++)
+            {
+                int code = codes[_rng.Next(codes.Length)];
+                int kind = code < 300 ? 1 : code < 400 ? 2 : code < 500 ? 3 : 4;
+                QI(kind, Ip() + " - [" + _rng.Next(1, 28).ToString("D2") + "/" + Pick(Months) + ":" + _rng.Next(0, 24).ToString("D2") + ":" + _rng.Next(0, 60).ToString("D2") + "] \"" +
+                    Pick(new[] { "GET", "GET", "POST", "PUT", "DELETE" }) + " " + Pick(LogPaths) + "\" " + code + " " + _rng.Next(120, 99999));
+            }
+        }
+
+        // ⑥ git log --graph 分支線圖
+        private static readonly string[] GitMsgs = { "merge branch 'feature/auth'", "fix: null deref in hook", "refactor crypto core", "bump deps", "add ci pipeline", "wip: dashboard", "hotfix: lockout", "docs: update readme", "perf: cache hot path" };
+        private void GitLog()
+        {
+            Q(6, "$ git log --oneline --graph --all");
+            string[] rails = { "* ", "* ", "│ ", "├─┐ ", "│ * ", "* │ ", "│╱ ", "├─┘ " };
+            for (int i = 0, n = _rng.Next(8, 14); i < n; i++)
+            {
+                string r = rails[_rng.Next(rails.Length)];
+                if (r.Contains("*")) QI(3, r + Hex(4).ToLower() + " " + Pick(GitMsgs));   // 黃 commit 雜湊
+                else QI(9, r);                                                            // 灰 分支線
+            }
+        }
+
+        // ── top 風格全屏進程監控（高資訊密度列表，仿 macOS top） ──────────────────
+        private static readonly string[] TopProcs =
+        {
+            "kernel_task", "launchd", "WindowServer", "Terminal", "top", "bash", "login", "Finder",
+            "Safari", "Dock", "mds", "mdworker", "coreaudiod", "cupsd", "quicklookd", "automountd",
+            "CVMCompiler", "xpchelper", "screencapture", "Spotlight", "syslogd", "configd", "powerd",
+            "bluetoothd", "imklaunchage", "launchdadd", "distnoted", "fseventsd", "hidd",
+        };
+        private string D2() { return _rng.Next(0, 100).ToString("D2"); }
+        private string Dec2() { return _rng.Next(0, 3) + "." + D2(); }
+        private string Clock() { return _rng.Next(0, 24).ToString("D2") + ":" + D2() + ":" + D2(); }
+        private string Mem()   // 隨機記憶體量，K / M 並偶帶 + 號（仿 top）
+        {
+            string plus = _rng.Next(2) == 0 ? "+" : "";
+            return (_rng.Next(4) == 0 ? _rng.Next(1, 99) + "M" : _rng.Next(120, 9999) + "K") + plus;
+        }
+
+        private void TopMonitor()
+        {
+            Q(6, "$ top -l 1");
+            int total = _rng.Next(180, 320), run = _rng.Next(1, 5), stuck = _rng.Next(0, 3);
+            QI(8, "Processes: " + total + " total, " + run + " running, " + stuck + " stuck, " + (total - run - stuck) + " sleeping, " + _rng.Next(800, 1900) + " threads   " + Clock());
+            int u = _rng.Next(2, 35), s = _rng.Next(2, 25);
+            QI(2, "Load Avg: " + Dec2() + ", " + Dec2() + ", " + Dec2() + "  CPU usage: " + u + "." + D2() + "% user, " + s + "." + D2() + "% sys, " + (100 - u - s) + "." + D2() + "% idle");
+            QI(9, "SharedLibs: " + _rng.Next(8, 40) + "M resident, " + _rng.Next(1000, 9000) + "K data, 0B linkedit.");
+            QI(9, "MemRegions: " + _rng.Next(8000, 30000) + " total, " + _rng.Next(200, 900) + "M resident, " + _rng.Next(20, 90) + "M private, " + _rng.Next(100, 400) + "M shared.");
+            QI(3, "PhysMem: " + _rng.Next(100, 400) + "M wired, " + _rng.Next(800, 2400) + "M active, " + _rng.Next(200, 900) + "M inactive, " + _rng.Next(1500, 3500) + "M used, " + _rng.Next(100, 600) + "M free.");
+            QI(6, "VM: " + _rng.Next(100, 400) + "G vsize, " + _rng.Next(800, 1500) + "M framework vsize, " + _rng.Next(100000, 200000) + "(0) pageins, " + _rng.Next(100, 900) + "(0) pageouts.");
+            QI(2, "Networks: packets: " + _rng.Next(1000000, 3000000) + "/" + _rng.Next(100, 1900) + "M in, " + _rng.Next(1000000, 3000000) + "/" + _rng.Next(100, 900) + "M out.");
+            QI(7, "Disks: " + _rng.Next(100000, 200000) + "/" + _rng.Next(1000, 5000) + "M read, " + _rng.Next(100000, 200000) + "/" + _rng.Next(1000, 6000) + "M written.");
+            QI(0, "");
+            QI(8, "PID    COMMAND       %CPU TIME     #TH #WQ #POR #MRE RPRVT  RSHRD RSIZE");
+            for (int i = 0, n = _rng.Next(12, 20); i < n; i++)
+            {
+                bool busy = _rng.Next(8) == 0;
+                string pid = _rng.Next(100, 99999).ToString().PadRight(6);
+                string cmd = Pick(TopProcs);
+                if (cmd.Length > 13) cmd = cmd.Substring(0, 13);
+                cmd = cmd.PadRight(13);
+                string cpu = (busy ? _rng.Next(1, 40) + "." + _rng.Next(0, 9) : "0.0").PadRight(4);
+                string time = "00:" + D2() + "." + D2();
+                string th = _rng.Next(1, 12).ToString().PadRight(3);
+                string wq = _rng.Next(0, 4).ToString().PadRight(3);
+                string por = (_rng.Next(20, 200) + (_rng.Next(2) == 0 ? "+" : "")).PadRight(4);
+                string mre = (_rng.Next(40, 200) + (_rng.Next(2) == 0 ? "+" : "")).PadRight(4);
+                QI(busy ? 1 : 0, pid + " " + cmd + " " + cpu + " " + time + " " + th + " " + wq + " " + por + " " + mre + " " + Mem().PadRight(6) + " " + Mem().PadRight(5) + " " + Mem());
+            }
+        }
+
+        private string PacketLine()
+        {
+            string proto = Pick(new[] { "TCP", "UDP", "TLS", "ICMP" });
+            return _rng.Next(10, 24) + ":" + _rng.Next(10, 60).ToString("D2") + ":" + _rng.Next(10, 60).ToString("D2") + "." + _rng.Next(100, 999) +
+                   "  " + Ip() + ":" + _rng.Next(1024, 65535) + " -> " + Ip() + ":" + _rng.Next(1, 1024) +
+                   "  " + proto + "  len=" + _rng.Next(40, 1460) + "  seq=0x" + Hex(4);
+        }
+
+        private static readonly string[] Procs = { "svchost", "lsass", "rundll32", "powershell", "wmic", "cmd", "explorer" };
+        private string Pick(string[] a) { return a[_rng.Next(a.Length)]; }
+        private string Ip() { return _rng.Next(1, 255) + "." + _rng.Next(0, 256) + "." + _rng.Next(0, 256) + "." + _rng.Next(1, 255); }
+        private string Hex(int bytes)
+        {
+            var sb = new StringBuilder(bytes * 2);
+            for (int i = 0; i < bytes; i++) sb.Append(_rng.Next(0, 256).ToString("X2"));
+            return sb.ToString();
+        }
+
+        private const int Palette = 11;     // 調色盤色數（語意分類）
+        private static Color ColorFor(int kind)
+        {
+            switch (kind)
+            {
+                case 1:  return Color.FromArgb(235, 90, 255, 130);   // 成功    亮綠
+                case 2:  return Color.FromArgb(228, 95, 215, 255);   // 資訊    青
+                case 3:  return Color.FromArgb(235, 245, 210, 80);   // 警告    黃
+                case 4:  return Color.FromArgb(240, 255, 95, 95);    // 錯誤    紅
+                case 5:  return Color.FromArgb(235, 80, 230, 205);   // 進度    藍綠 teal
+                case 6:  return Color.FromArgb(232, 110, 165, 255);  // 路徑/提示符 藍
+                case 7:  return Color.FromArgb(230, 225, 130, 240);  // 數值/雜湊   洋紅
+                case 8:  return Color.FromArgb(242, 235, 240, 245);  // 標題/表頭   亮白
+                case 9:  return Color.FromArgb(195, 140, 150, 150);  // 次要/註解   灰
+                case 10: return Color.FromArgb(238, 255, 175, 70);   // 品牌/強調   橙
+                default: return Color.FromArgb(215, 200, 210, 195);  // 一般    中性淺灰白
+            }
+        }
+
+        // 圓角矩形路徑（四角皆圓）
+        private static GraphicsPath RoundedRect(Rectangle r, int rad)
+        {
+            var p = new GraphicsPath();
+            int d = rad * 2;
+            if (d <= 0 || d > r.Width || d > r.Height) { p.AddRectangle(r); return p; }
+            p.AddArc(r.Left, r.Top, d, d, 180, 90);
+            p.AddArc(r.Right - d, r.Top, d, d, 270, 90);
+            p.AddArc(r.Right - d, r.Bottom - d, d, d, 0, 90);
+            p.AddArc(r.Left, r.Bottom - d, d, d, 90, 90);
+            p.CloseFigure();
+            return p;
+        }
+        // 僅上方兩角為圓（標題列用）
+        private static GraphicsPath RoundedRectTop(Rectangle r, int rad)
+        {
+            var p = new GraphicsPath();
+            int d = rad * 2;
+            p.AddArc(r.Left, r.Top, d, d, 180, 90);
+            p.AddArc(r.Right - d, r.Top, d, d, 270, 90);
+            p.AddLine(r.Right, r.Top + rad, r.Right, r.Bottom);
+            p.AddLine(r.Right, r.Bottom, r.Left, r.Bottom);
+            p.CloseFigure();
+            return p;
+        }
+        private static void DrawDot(Graphics g, int x, int y, int dia, Color c)
+        {
+            using (var b = new SolidBrush(c)) g.FillEllipse(b, x, y, dia, dia);
+        }
+
+        public void Render(Graphics g, Rectangle area, float scale)
+        {
+            int fontPx = Math.Max(11, (int)(12 * scale));
+            int lineH = (int)(fontPx * 1.3);
+            int pad = (int)(14 * scale);
+            int titleH = Math.Max(22, (int)(28 * scale));
+            int radius = Math.Max(6, (int)(10 * scale));
+
+            // ── macOS Terminal 風視窗 chrome ──────────────────────────────────
+            var prevSmooth = g.SmoothingMode;
+            g.SmoothingMode = SmoothingMode.AntiAlias;
+
+            using (var path = RoundedRect(area, radius))
+            using (var body = new SolidBrush(Color.FromArgb(214, 12, 16, 14)))   // 內容底色（半透）
+            using (var border = new Pen(Color.FromArgb(180, 90, 98, 100), Math.Max(1f, scale)))
+            {
+                g.FillPath(body, path);
+                g.DrawPath(border, path);
+            }
+
+            var titleRect = new Rectangle(area.Left, area.Top, area.Width, titleH);
+            using (var tpath = RoundedRectTop(titleRect, radius))
+            using (var tbg = new LinearGradientBrush(titleRect, Color.FromArgb(240, 66, 68, 74), Color.FromArgb(240, 44, 46, 52), LinearGradientMode.Vertical))
+                g.FillPath(tbg, tpath);
+
+            // 紅 / 黃 / 綠 三燈
+            int dia = Math.Max(8, (int)(12 * scale));
+            int dy = area.Top + (titleH - dia) / 2;
+            int dx = area.Left + (int)(16 * scale);
+            int gap = dia + (int)(8 * scale);
+            DrawDot(g, dx, dy, dia, Color.FromArgb(255, 95, 86));
+            DrawDot(g, dx + gap, dy, dia, Color.FromArgb(255, 189, 46));
+            DrawDot(g, dx + gap * 2, dy, dia, Color.FromArgb(39, 201, 63));
+            g.SmoothingMode = prevSmooth;
+
+            // 內容區（標題列下方，左右內縮）
+            var content = new Rectangle(area.Left, area.Top + titleH, area.Width, area.Height - titleH);
+
+            // 顯示清單 = 已完成行 + 正在打字的行
+            var disp = new List<Line>(_lines);
+            if (_typing != null)
+                disp.Add(new Line { Text = _typing.Substring(0, Math.Min(_typed, _typing.Length)), Kind = _typingKind });
+
+            int vis = Math.Max(1, (content.Height - pad * 2) / lineH);
+            int start = Math.Max(0, disp.Count - vis);
+
+            // 置中標題列文字（顯示視窗尺寸，仿截圖的 80×24）
+            using (var tFont = new Font("Segoe UI Semibold", Math.Max(9f, 10f * scale), FontStyle.Regular, GraphicsUnit.Point))
+            using (var tBrush = new SolidBrush(Color.FromArgb(230, 205, 208, 212)))
+            using (var tFmt = new StringFormat { Alignment = StringAlignment.Center, LineAlignment = StringAlignment.Center })
+                g.DrawString("StillGuard — zsh — " + _cols + "×" + vis, tFont, tBrush, new RectangleF(area.Left, area.Top, area.Width, titleH), tFmt);
+
+            var brushes = new SolidBrush[Palette];
+            for (int k = 0; k < Palette; k++) brushes[k] = new SolidBrush(ColorFor(k));
+            var savedClip = g.Clip;                       // 限制長行只在內容區內，超出裁切
+            g.IntersectClip(content);
+            using (var font = new Font("Consolas", fontPx, FontStyle.Regular, GraphicsUnit.Pixel))
+            using (var fmt = new StringFormat(StringFormatFlags.NoWrap))
+            {
+                int y = content.Top + pad;
+                for (int i = start; i < disp.Count; i++)
+                {
+                    var ln = disp[i];
+                    g.DrawString(ln.Text, font, brushes[ln.Kind % Palette], content.Left + pad, y, fmt);
+                    y += lineH;
+                }
+                if (_frame % 8 < 5 && disp.Count > 0)   // 閃爍游標
+                {
+                    string lastLine = disp[disp.Count - 1].Text;
+                    float w = g.MeasureString(lastLine, font, int.MaxValue, fmt).Width;
+                    g.DrawString("_", font, brushes[1], content.Left + pad + w, y - lineH, fmt);
+                }
+            }
+            g.Clip = savedClip;
+            for (int k = 0; k < Palette; k++) brushes[k].Dispose();
+        }
+    }
+
     // =========================================================================
     //  背景層（第 5 節）
     // =========================================================================
@@ -867,10 +1884,19 @@ namespace StillGuard
         private string _lastMinute = "";
         private readonly System.Windows.Forms.Timer _tick = new System.Windows.Forms.Timer();
 
+        // 駭客終端特效
+        private readonly FakeTerminal _terminal = new FakeTerminal();
+        private readonly System.Windows.Forms.Timer _animTimer = new System.Windows.Forms.Timer();
+
         // OTP 一次性救援碼
         private readonly OtpState _otp = new OtpState();
         private string _otpHint = "";                 // 鎖屏底部的 OTP 狀態提示
         private DateTime _otpLastSent = DateTime.MinValue;
+
+        // Telegram 遠端解鎖輪詢（手機送「/unlock <碼>」即解鎖）
+        private Thread _tgListener;
+        private volatile bool _listening;
+        private long _tgOffset;
 
         // 鉤子
         private IntPtr _kbHook = IntPtr.Zero;
@@ -920,15 +1946,44 @@ namespace StillGuard
 
             InstallHooks();
             _tick.Start();
+            StartTelegramListener();   // 啟動 Telegram 遠端解鎖輪詢（若已設定）
+
+            // 駭客終端特效動畫
+            if (_cfg.showTerminal)
+            {
+                float sc = PanelScale();
+                int fontPx = Math.Max(11, (int)(12 * sc));
+                int pad = (int)(14 * sc);
+                int cols = (int)((GetTerminalRect().Width - pad * 2) / (fontPx * 0.6));
+                _terminal.SetCols(cols);
+                _animTimer.Interval = 32;
+                _animTimer.Tick += OnAnim;
+                _animTimer.Start();
+            }
             Invalidate();
         }
 
         private void OnClosed(object sender, FormClosedEventArgs e)
         {
+            _listening = false;   // 停止 Telegram 輪詢（背景緒為 IsBackground，會自行結束）
             _tick.Stop();
+            _animTimer.Stop();
             UninstallHooks();
             Cursor.Show();
             if (_background != null) { _background.Dispose(); _background = null; }
+        }
+
+        private void OnAnim(object sender, EventArgs e)
+        {
+            _terminal.Step();
+            Invalidate(GetTerminalRect());
+        }
+
+        private Rectangle GetTerminalRect()
+        {
+            var s = _primaryLocal;
+            int mx = (int)(s.Width * 0.06), my = (int)(s.Height * 0.06);
+            return new Rectangle(s.Left + mx, s.Top + my, s.Width - mx * 2, s.Height - my * 2);
         }
 
         private void OnTick(object sender, EventArgs e)
@@ -963,6 +2018,9 @@ namespace StillGuard
 
             if (_background != null) g.DrawImageUnscaled(_background, 0, 0);
             else g.Clear(Color.Black);
+
+            // 駭客終端特效（疊在背景上、時鐘與面板之下）
+            if (_cfg.showTerminal) _terminal.Render(g, GetTerminalRect(), PanelScale());
 
             // 內建時鐘（閒置態與輸入態都顯示）
             if (_cfg.showClock) ClockRenderer.Draw(g, _primaryLocal);
@@ -1204,6 +2262,8 @@ namespace StillGuard
 
             string code = _otp.Generate();
             string msg = "【StillGuard 靜守】一次性解鎖碼：" + code + "（5 分鐘內有效）";
+            if (_cfg.otp.channel == "telegram")
+                msg += "\n\n可直接回覆「/unlock " + code + "」遠端解鎖本機。";
             _otpHint = "寄送中…";
             InvalidatePanel();
 
@@ -1215,10 +2275,90 @@ namespace StillGuard
                 string err = "通道建立失敗";
                 bool ok = (n != null) && n.Send(msg, out err);
                 string hint = ok ? "已寄出，請查看你的裝置（5 分鐘內有效）" : ("寄送失敗：" + (err ?? "未知錯誤"));
+                Beep(ok);   // 無畫面情境的聲音回饋
                 try { BeginInvoke((MethodInvoker)(() => { _otpHint = hint; InvalidatePanel(); })); } catch { }
             });
             t.IsBackground = true;
             t.Start();
+        }
+
+        // ---- Telegram 遠端解鎖：鎖屏期間背景輪詢 getUpdates ----
+        // 安全模型：① 僅接受設定的 chat_id 來訊 ② 必須附帶 F2 取得的一次性碼（雙重驗證）
+        private void StartTelegramListener()
+        {
+            var o = _cfg.otp;
+            if (o == null || !o.enabled || o.channel != "telegram") return;
+            string token = DataProtector.Unprotect(o.telegramToken);
+            string chatId = o.telegramChatId;
+            if (string.IsNullOrEmpty(token) || string.IsNullOrEmpty(chatId)) return;
+
+            _listening = true;
+            _tgListener = new Thread(() => TelegramListenLoop(token, chatId)) { IsBackground = true };
+            _tgListener.Start();
+        }
+
+        private void TelegramListenLoop(string token, string chatId)
+        {
+            ServicePointManager.SecurityProtocol = (SecurityProtocolType)3072;
+            var ser = new JavaScriptSerializer();
+            bool drain = true;   // 首輪只清空積壓訊息（避免重播鎖屏前的舊指令）
+
+            while (_listening)
+            {
+                try
+                {
+                    string url = "https://api.telegram.org/bot" + token + "/getUpdates?timeout=20&offset=" + _tgOffset;
+                    string json;
+                    using (var wc = new WebClient()) { wc.Encoding = Encoding.UTF8; json = wc.DownloadString(url); }
+                    if (!_listening) break;
+
+                    var root = ser.DeserializeObject(json) as Dictionary<string, object>;
+                    var arr = (root != null && root.ContainsKey("result")) ? root["result"] as object[] : null;
+                    if (arr != null)
+                    {
+                        foreach (var it in arr)
+                        {
+                            var upd = it as Dictionary<string, object>;
+                            if (upd == null) continue;
+                            long uid = Convert.ToInt64(upd["update_id"]);
+                            if (uid >= _tgOffset) _tgOffset = uid + 1;   // 標記已讀
+
+                            if (drain) continue;   // 首輪不處理，只推進 offset
+
+                            var m = (upd.ContainsKey("message") ? upd["message"] : null) as Dictionary<string, object>;
+                            if (m == null) continue;
+                            var chat = (m.ContainsKey("chat") ? m["chat"] : null) as Dictionary<string, object>;
+                            string fromId = (chat != null && chat.ContainsKey("id")) ? Convert.ToString(chat["id"]) : "";
+                            string text = m.ContainsKey("text") ? Convert.ToString(m["text"]) : "";
+                            if (fromId != chatId) continue;   // 僅接受設定的 chat_id
+                            if (TryRemoteUnlock(text)) return;
+                        }
+                    }
+                    drain = false;
+                }
+                catch { Thread.Sleep(3000); }   // 連線失敗，稍候重試
+            }
+        }
+
+        // 解析「/unlock <碼>」（容忍 /unlock@botname），碼須通過一次性驗證
+        private bool TryRemoteUnlock(string text)
+        {
+            if (string.IsNullOrEmpty(text)) return false;
+            var parts = text.Trim().Split(new[] { ' ', '\t', '\n' }, StringSplitOptions.RemoveEmptyEntries);
+            if (parts.Length < 2) return false;
+            if (!parts[0].StartsWith("/unlock", StringComparison.OrdinalIgnoreCase)) return false;
+            if (!_otp.Verify(parts[parts.Length - 1].Trim())) return false;
+
+            _listening = false;
+            try { Beep(true); } catch { }
+            try { BeginInvoke((MethodInvoker)(() => { _otpHint = "已遠端解鎖"; Unlock(); })); } catch { }
+            return true;
+        }
+
+        // 無畫面情境的聲音回饋（成功 = 雙高音；失敗 = 單低音）
+        private static void Beep(bool ok)
+        {
+            try { if (ok) { Console.Beep(880, 120); Console.Beep(1320, 160); } else Console.Beep(330, 250); } catch { }
         }
 
         private string TranslateToChar(int vk, uint scanCode)
@@ -1374,6 +2514,7 @@ namespace StillGuard
         private Bitmap _desktopThumb;        // 主螢幕截圖縮圖（原圖，未模糊）
         private readonly Rectangle _primary;
         private readonly System.Windows.Forms.Timer _clock = new System.Windows.Forms.Timer();
+        private readonly FakeTerminal _previewTerm = new FakeTerminal();
 
         public PreviewPanel()
         {
@@ -1381,7 +2522,7 @@ namespace StillGuard
             DoubleBuffered = true;
             BackColor = Color.Black;
             CaptureDesktop();
-            _clock.Interval = 1000;           // 讓預覽的時鐘也會跳秒
+            _clock.Interval = 1000;           // 讓預覽的時鐘也會跳秒（終端在此節奏緩慢示意）
             _clock.Tick += (s, e) => Invalidate();
             _clock.Start();
         }
@@ -1431,8 +2572,21 @@ namespace StillGuard
             using (var bg = BuildPreviewBackground(dw, dh))
                 if (bg != null) g.DrawImage(bg, dest);
 
-            // 內建時鐘（用縮放座標，使字級/位置與實機一致）
             g.TextRenderingHint = TextRenderingHint.ClearTypeGridFit;
+
+            // 駭客終端特效（疊在背景上、時鐘之下；預覽以 1 秒節奏緩慢滾動示意）
+            if (_cfg.showTerminal)
+            {
+                int mx = (int)(dw * 0.06), my = (int)(dh * 0.06);
+                var trect = new Rectangle(dx + mx, dy + my, dw - mx * 2, dh - my * 2);
+                float tsc = (float)((double)dh / _primary.Height);
+                int fpx = Math.Max(11, (int)(12 * tsc)), tpad = (int)(14 * tsc);
+                _previewTerm.SetCols((int)((trect.Width - tpad * 2) / (fpx * 0.6)));
+                _previewTerm.Step();
+                _previewTerm.Render(g, trect, tsc);
+            }
+
+            // 內建時鐘（用縮放座標，使字級/位置與實機一致）
             if (_cfg.showClock)
             {
                 var state = g.Save();
@@ -1521,6 +2675,7 @@ namespace StillGuard
         private TextBox _imagePath;
         private Button _browseImage;
         private CheckBox _showClock;
+        private CheckBox _showTerminal;
         private PreviewPanel _preview;
         private TextBox _pw1, _pw2;
         private TextBox _rescue1, _rescue2;
@@ -1632,6 +2787,9 @@ namespace StillGuard
             _showClock = new CheckBox { Text = "顯示時鐘（畫面中央，字級隨螢幕自動縮放）", AutoSize = true, Margin = new Padding(3, 4, 3, 4) };
             _showClock.CheckedChanged += (s, e) => { Pull(); UpdatePreview(); };
             left.Controls.Add(_showClock);
+            _showTerminal = new CheckBox { Text = "駭客終端特效（綠字假指令不停滾動，純裝飾）", AutoSize = true, Margin = new Padding(3, 4, 3, 4) };
+            _showTerminal.CheckedChanged += (s, e) => { Pull(); UpdatePreview(); };
+            left.Controls.Add(_showTerminal);
 
             left.Controls.Add(SectionLabel("變更主密碼"));
             var pwPanel = new TableLayoutPanel { ColumnCount = 2, AutoSize = true, Dock = DockStyle.Top };
@@ -1777,6 +2935,7 @@ namespace StillGuard
                 _hotkeyBox.Text = string.IsNullOrWhiteSpace(_cfg.hotkey) ? "" : _cfg.hotkey;
 
                 _showClock.Checked = _cfg.showClock;
+                _showTerminal.Checked = _cfg.showTerminal;
 
                 var o = _cfg.otp ?? new OtpConfig();
                 _otpEnabled.Checked = o.enabled;
@@ -1817,6 +2976,7 @@ namespace StillGuard
             // 錄製中欄位顯示的是提示字，不可當成熱鍵值寫入
             if (!_hotkeyRecording) _cfg.hotkey = (_hotkeyBox.Text ?? "").Trim();
             _cfg.showClock = _showClock.Checked;
+            _cfg.showTerminal = _showTerminal.Checked;
         }
 
         private void UpdatePreview() { _preview.SetConfig(_cfg); }
