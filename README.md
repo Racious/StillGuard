@@ -159,8 +159,9 @@ build.bat
 | `showClock` | 鎖屏是否顯示內建時鐘（字級隨螢幕自動縮放） |
 | `showTerminal` | 鎖屏是否疊加終端特效（純裝飾，不影響安全） |
 | `terminalStyle` | 終端風格：`hacker`（駭客：隨機綠字假指令）/ `guard`（仿真守護：貼合 StillGuard 功能的擬真日誌，具生命週期與遞增計數） |
-| `fakeUpdate` | 偽 Windows 更新畫面（障眼模式）：黑底 + 追逐圓點 + 多階段進度，啟用時蓋過背景/時鐘/終端，且**不顯示密碼框**。仍可盲打密碼 Enter 解鎖、F2 寄 OTP、手機 `/unlock` 遠端解鎖 |
+| `fakeUpdate` | 偽 Windows 更新畫面（障眼模式）：黑底 +「正在處理更新」追逐圓點 + 進度**卡在 99%**（復刻迷因，永不顯示完成），啟用時蓋過背景/時鐘/終端，且**不顯示密碼框**。仍可盲打密碼 Enter 解鎖、F2 寄 OTP、手機 `/unlock` 遠端解鎖 |
 | `fakeUpdateLang` | 偽更新畫面文字語言：`zh`（中文）/ `en`（英文） |
+| `showPasswordPanel` | 鎖屏是否顯示密碼輸入框（預設 `true`）。設 `false`＝任何顯示模式都隱藏輸入框，仍可盲打密碼 Enter / F2 / 手機 `/unlock` 解鎖 |
 
 > `password`、`rescue`、`otp` 等敏感欄位由**設定視窗自動寫入**（雜湊 / DPAPI 加密），請勿手動編輯。
 

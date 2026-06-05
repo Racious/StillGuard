@@ -341,6 +341,7 @@ namespace StillGuard
         public string terminalStyle = "hacker";   // 終端風格：hacker（駭客）| guard（仿真守護）
         public bool fakeUpdate = false;            // 偽 Windows 更新畫面（障眼模式，蓋過其他顯示）
         public string fakeUpdateLang = "zh";       // 偽更新畫面文字語言：zh（中文）| en（英文）
+        public bool showPasswordPanel = true;      // 鎖屏是否顯示密碼輸入框（false＝隱藏，仍可盲打密碼 / F2 解鎖）
         public List<WidgetConfig> widgets = new List<WidgetConfig>();
         public PasswordConfig password = null;   // 主密碼雜湊（由 UI 設定）
         public PasswordConfig rescue = null;     // 救援碼雜湊（可選，由 UI 設定）
@@ -383,6 +384,7 @@ namespace StillGuard
             cfg.terminalStyle = GetStr(root, "terminalStyle", cfg.terminalStyle);
             cfg.fakeUpdate = GetBool(root, "fakeUpdate", cfg.fakeUpdate);
             cfg.fakeUpdateLang = GetStr(root, "fakeUpdateLang", cfg.fakeUpdateLang);
+            cfg.showPasswordPanel = GetBool(root, "showPasswordPanel", cfg.showPasswordPanel);
 
             cfg.password = ReadPwd(root, "password");
             cfg.rescue = ReadPwd(root, "rescue");
@@ -451,7 +453,8 @@ namespace StillGuard
             sb.AppendLine("  \"showTerminal\": " + (showTerminal ? "true" : "false") + ",");
             sb.AppendLine("  \"terminalStyle\": " + JStr(terminalStyle) + ",");
             sb.AppendLine("  \"fakeUpdate\": " + (fakeUpdate ? "true" : "false") + ",");
-            sb.AppendLine("  \"fakeUpdateLang\": " + JStr(fakeUpdateLang) + (members.Count > 0 ? "," : ""));
+            sb.AppendLine("  \"fakeUpdateLang\": " + JStr(fakeUpdateLang) + ",");
+            sb.AppendLine("  \"showPasswordPanel\": " + (showPasswordPanel ? "true" : "false") + (members.Count > 0 ? "," : ""));
             for (int i = 0; i < members.Count; i++)
                 sb.AppendLine("  " + members[i] + (i < members.Count - 1 ? "," : ""));
 
@@ -2204,14 +2207,13 @@ namespace StillGuard
     {
         private readonly Random _rng = new Random();
         private float _t;         // spinner 全域時間相位（0~1 循環）
-        private int _pct;         // 目前階段的已完成百分比
-        private int _stage;       // 更新階段索引（循環，永遠在忙，不會顯示成「完成」）
+        private int _pct;         // 已完成百分比
         private int _wait;        // 距下次 +1% 的剩餘 tick（製造緩慢與卡頓）
         public string Lang = "zh";   // 文字語言：zh（中文）| en（英文）
 
-        // 多階段標題（仿真實 Windows 更新：下載 → 處理 → 設定 → 即將完成，各階段各自 0~100%）
-        private static readonly string[] StagesZh = { "正在下載更新", "正在處理更新", "正在設定更新", "即將完成" };
-        private static readonly string[] StagesEn = { "Downloading updates", "Working on updates", "Configuring update for Windows", "Almost done" };
+        // 採真實的「正在處理更新 / Working on updates」單一畫面，並複刻著名的「卡 99%」行為
+        private const string CaptionZh = "正在處理更新";
+        private const string CaptionEn = "Working on updates";
 
         private const float CycleSec = 1.6f;   // 圓點繞行一圈的週期（秒）
         private const int DotCount = 5;        // 追逐圓點數量（仿 Windows boot throbber）
@@ -2223,18 +2225,21 @@ namespace StillGuard
             if (_t >= 1f) _t -= 1f;
 
             if (_wait > 0) { _wait--; return; }
-            if (_pct >= 100)
+
+            // 卡 99%：到 99% 後長時間停滯（spinner 仍轉、永不顯示 100% 完成），
+            // 偶爾「重跑一輪」回到較低 % 再爬，模擬又一輪更新——永遠在忙。
+            if (_pct >= 99)
             {
-                // 到 100% → 進入下一個更新階段（標題改變、百分比歸零），永遠在忙不會「完成」
-                _pct = 0;
-                _stage = (_stage + 1) % StagesZh.Length;
-                _wait = _rng.Next(60, 120);                       // 階段間短暫停頓
+                _pct = 99;
+                if (_rng.Next(40) == 0) { _pct = _rng.Next(15, 47); _wait = _rng.Next(30, 80); }   // 偶發重跑
+                else _wait = _rng.Next(40, 120);                  // 持續卡在 99%
                 return;
             }
 
             _pct++;
-            _wait = _rng.Next(20, 55);                            // 每 1% 約 0.6~1.8 秒
-            if (_rng.Next(10) == 0) _wait += _rng.Next(40, 120);  // 偶爾卡住（像在等待）
+            if (_pct < 90) _wait = _rng.Next(20, 55);             // 前段正常爬升（每 1% 約 0.6~1.8 秒）
+            else _wait = _rng.Next(70, 160);                      // 90~98% 明顯放慢（接近尾端拖長）
+            if (_pct < 90 && _rng.Next(10) == 0) _wait += _rng.Next(40, 120);  // 前段偶爾卡頓
         }
 
         // 平滑緩動（頭尾慢、中段快）→ 圓點繞行時聚散加速，貼近 Windows throbber 觀感
@@ -2278,9 +2283,8 @@ namespace StillGuard
 
             bool en = (Lang ?? "zh").Trim().ToLowerInvariant() == "en";
             string family = en ? "Segoe UI" : "Microsoft JhengHei UI";
-            int st = _stage % StagesZh.Length;
-            string mainText = en ? (StagesEn[st] + "  " + _pct + "% complete")
-                                 : (StagesZh[st] + "  " + _pct + "% 完成");
+            string mainText = en ? (CaptionEn + "  " + _pct + "% complete")
+                                 : (CaptionZh + "  " + _pct + "%");
             string subText = en ? "Don't turn off your computer." : "請勿關閉電腦。";
 
             using (var fMain = new Font(family, mainPx, FontStyle.Regular, GraphicsUnit.Pixel))
@@ -2667,8 +2671,8 @@ namespace StillGuard
             // 內建時鐘（閒置態與輸入態都顯示）
             if (_cfg.showClock) ClockRenderer.Draw(g, _primaryLocal);
 
-            // 輸入態：密碼面板
-            if (_state == UiState.Input) DrawPasswordPanel(g);
+            // 輸入態：密碼面板（可設定隱藏；隱藏時仍可盲打密碼 Enter / F2 解鎖）
+            if (_state == UiState.Input && _cfg.showPasswordPanel) DrawPasswordPanel(g);
         }
 
         // 面板縮放倍率（以 1080p 為基準，夾在 1.0~3.0 倍）
@@ -3360,6 +3364,7 @@ namespace StillGuard
         private ComboBox _termStyle;
         private CheckBox _fakeUpdate;
         private ComboBox _fakeUpdateLang;
+        private CheckBox _showPwPanel;
         private PreviewPanel _preview;
         private TextBox _pw1, _pw2;
         private TextBox _rescue1, _rescue2;
@@ -3402,7 +3407,7 @@ namespace StillGuard
         // ---- 介面建構 ----
         private void BuildUi()
         {
-            // 左：設定欄；右：即時預覽
+            // 左：分頁設定；右：即時預覽
             var split = new SplitContainer
             {
                 Dock = DockStyle.Fill,
@@ -3410,168 +3415,144 @@ namespace StillGuard
                 FixedPanel = FixedPanel.Panel2
             };
             Controls.Add(split);
-            try { split.SplitterDistance = 460; } catch { }
+            try { split.SplitterDistance = 520; } catch { }
 
-            // ===== 左側設定 =====
-            var left = new TableLayoutPanel { Dock = DockStyle.Fill, ColumnCount = 1, Padding = new Padding(12), AutoScroll = true };
-            split.Panel1.Controls.Add(left);
+            // ===== 左側：分頁設定 =====
+            var tabs = new TabControl { Dock = DockStyle.Fill, Padding = new Point(16, 6) };
+            var pgAppearance = new TabPage("外觀");
+            var pgSecurity = new TabPage("安全");
+            var pgNotify = new TabPage("通知");
+            var pgAbout = new TabPage("關於");
+            tabs.TabPages.AddRange(new TabPage[] { pgAppearance, pgSecurity, pgNotify, pgAbout });
+            split.Panel1.Controls.Add(tabs);
 
-            left.Controls.Add(SectionLabel("背景"));
+            // ---- 外觀 ----
+            var app = TabHost(pgAppearance);
 
-            var bgPanel = new TableLayoutPanel { ColumnCount = 4, AutoSize = true, Dock = DockStyle.Top };
-            bgPanel.Controls.Add(new Label { Text = "類型", AutoSize = true, Anchor = AnchorStyles.Left, Margin = new Padding(3, 7, 3, 3) }, 0, 0);
-            _bgType = new ComboBox { DropDownStyle = ComboBoxStyle.DropDownList, Width = 140 };
-            _bgType.Items.AddRange(new object[] { "blurDesktop", "image", "solidDark" });
+            var bg = NewGrid();
+            _bgType = Combo(160, new object[] { "blurDesktop", "image", "solidDark" });
             _bgType.SelectedIndexChanged += (s, e) => { Pull(); UpdatePreview(); };
-            bgPanel.Controls.Add(_bgType, 1, 0);
-
-            bgPanel.Controls.Add(new Label { Text = "模糊", AutoSize = true, Anchor = AnchorStyles.Left, Margin = new Padding(12, 7, 3, 3) }, 2, 0);
-            _blur = new NumericUpDown { Minimum = 0, Maximum = 60, Width = 70 };
+            Row(bg, "類型", _bgType);
+            _blur = Num(0, 60, 80);
             _blur.ValueChanged += (s, e) => { Pull(); UpdatePreview(); };
-            bgPanel.Controls.Add(_blur, 3, 0);
-
-            bgPanel.Controls.Add(new Label { Text = "變暗 %", AutoSize = true, Anchor = AnchorStyles.Left, Margin = new Padding(3, 7, 3, 3) }, 0, 1);
-            _dim = new NumericUpDown { Minimum = 0, Maximum = 100, Width = 70 };
+            Row(bg, "模糊", _blur);
+            _dim = Num(0, 100, 80);
             _dim.ValueChanged += (s, e) => { Pull(); UpdatePreview(); };
-            bgPanel.Controls.Add(_dim, 1, 1);
-            left.Controls.Add(bgPanel);
-
-            var imgPanel = new TableLayoutPanel { ColumnCount = 3, AutoSize = true, Dock = DockStyle.Top };
-            imgPanel.Controls.Add(new Label { Text = "圖片", AutoSize = true, Anchor = AnchorStyles.Left, Margin = new Padding(3, 7, 3, 3) }, 0, 0);
-            _imagePath = new TextBox { Width = 280 };
+            Row(bg, "變暗 %", _dim);
+            _imagePath = new TextBox { Width = 250 };
             _imagePath.TextChanged += (s, e) => { Pull(); UpdatePreview(); };
-            imgPanel.Controls.Add(_imagePath, 1, 0);
             _browseImage = new Button { Text = "瀏覽…", AutoSize = true };
             _browseImage.Click += BrowseImage;
-            imgPanel.Controls.Add(_browseImage, 2, 0);
-            left.Controls.Add(imgPanel);
+            RowWrap(bg, "圖片", _imagePath, _browseImage);
+            app.Controls.Add(Group("背景", bg));
 
-            left.Controls.Add(SectionLabel("行為"));
-            var behav = new TableLayoutPanel { ColumnCount = 3, AutoSize = true, Dock = DockStyle.Top };
-            behav.Controls.Add(new Label { Text = "輸入逾時（秒）", AutoSize = true, Anchor = AnchorStyles.Left, Margin = new Padding(3, 7, 3, 3) }, 0, 0);
-            _idle = new NumericUpDown { Minimum = 3, Maximum = 120, Width = 70 };
+            var disp = NewGrid();
+            _showClock = Check("顯示時鐘（畫面中央，字級隨螢幕自動縮放）");
+            _showClock.CheckedChanged += (s, e) => { Pull(); UpdatePreview(); };
+            Full(disp, _showClock);
+            _showTerminal = Check("顯示終端特效（鎖屏疊加滾動日誌，純裝飾）");
+            _showTerminal.CheckedChanged += (s, e) => { if (_termStyle != null) _termStyle.Enabled = _showTerminal.Checked; Pull(); UpdatePreview(); };
+            Full(disp, _showTerminal);
+            _termStyle = Combo(280, new object[] { "駭客終端（隨機綠字指令）", "仿真守護終端（StillGuard 擬真日誌）" });
+            _termStyle.SelectedIndexChanged += (s, e) => { Pull(); UpdatePreview(); };
+            Row(disp, "風格", _termStyle);
+            _fakeUpdate = Check("偽 Windows 更新畫面（黑底旋轉圈，啟用時蓋過背景/時鐘/終端）");
+            _fakeUpdate.CheckedChanged += (s, e) => { if (_fakeUpdateLang != null) _fakeUpdateLang.Enabled = _fakeUpdate.Checked; Pull(); UpdatePreview(); };
+            Full(disp, _fakeUpdate);
+            _fakeUpdateLang = Combo(150, new object[] { "中文", "English" });
+            _fakeUpdateLang.SelectedIndexChanged += (s, e) => { Pull(); UpdatePreview(); };
+            Row(disp, "語言", _fakeUpdateLang);
+            _showPwPanel = Check("顯示密碼輸入框（取消勾選＝隱藏，仍可盲打密碼 Enter / F2 解鎖）");
+            _showPwPanel.CheckedChanged += (s, e) => Pull();
+            Full(disp, _showPwPanel);
+            Full(disp, Hint("勾「偽更新畫面」時一律接管整個鎖屏且不顯示密碼框（仍可盲打密碼 / F2 / 手機解鎖）。"));
+            app.Controls.Add(Group("鎖屏顯示", disp));
+
+            // ---- 安全 ----
+            var sec = TabHost(pgSecurity);
+
+            var behav = NewGrid();
+            _idle = Num(3, 120, 80);
             _idle.ValueChanged += (s, e) => Pull();
-            behav.Controls.Add(_idle, 1, 0);
-
-            behav.Controls.Add(new Label { Text = "鎖定快捷鍵", AutoSize = true, Anchor = AnchorStyles.Left, Margin = new Padding(3, 7, 3, 3) }, 0, 1);
-            _hotkeyBox = new TextBox { Width = 160, ReadOnly = true, Cursor = Cursors.Hand };
+            RowWrap(behav, "輸入逾時", _idle, SmallLabel("秒（無操作退回閒置）"));
+            _hotkeyBox = new TextBox { Width = 170, ReadOnly = true, Cursor = Cursors.Hand };
             _hotkeyBox.KeyDown += HotkeyBox_KeyDown;
             _hotkeyBox.Click += (s, e) => BeginHotkeyRecord();
             _hotkeyBox.Leave += (s, e) => CancelHotkeyRecord();
-            behav.Controls.Add(_hotkeyBox, 1, 1);
             var hkBtn = new Button { Text = "變更…", AutoSize = true };
             hkBtn.Click += (s, e) => BeginHotkeyRecord();
-            behav.Controls.Add(hkBtn, 2, 1);
-            _hotkeyStatus = new Label { AutoSize = true, Margin = new Padding(3, 7, 3, 3), ForeColor = Color.DimGray };
-            behav.Controls.Add(_hotkeyStatus, 1, 2);
-            behav.Controls.Add(new Label { Text = "點「變更…」後，直接按下想要的組合鍵（如 Ctrl+Shift+L）", AutoSize = true, ForeColor = Color.DimGray, Margin = new Padding(3, 2, 3, 3) }, 1, 3);
-            left.Controls.Add(behav);
+            RowWrap(behav, "鎖定快捷鍵", _hotkeyBox, hkBtn);
+            _hotkeyStatus = new Label { AutoSize = true, ForeColor = Color.DimGray };
+            Full(behav, _hotkeyStatus);
+            Full(behav, Hint("點「變更…」後直接按下想要的組合鍵（如 Ctrl+Shift+L）。留空＝停用熱鍵。"));
+            sec.Controls.Add(Group("行為", behav));
 
-            left.Controls.Add(SectionLabel("鎖屏顯示"));
-            _showClock = new CheckBox { Text = "顯示時鐘（畫面中央，字級隨螢幕自動縮放）", AutoSize = true, Margin = new Padding(3, 4, 3, 4) };
-            _showClock.CheckedChanged += (s, e) => { Pull(); UpdatePreview(); };
-            left.Controls.Add(_showClock);
-            _showTerminal = new CheckBox { Text = "顯示終端特效（鎖屏疊加滾動日誌，純裝飾）", AutoSize = true, Margin = new Padding(3, 4, 3, 4) };
-            _showTerminal.CheckedChanged += (s, e) => { if (_termStyle != null) _termStyle.Enabled = _showTerminal.Checked; Pull(); UpdatePreview(); };
-            left.Controls.Add(_showTerminal);
-
-            var termPanel = new TableLayoutPanel { ColumnCount = 2, AutoSize = true, Dock = DockStyle.Top };
-            termPanel.Controls.Add(new Label { Text = "風格", AutoSize = true, Anchor = AnchorStyles.Left, Margin = new Padding(18, 7, 3, 3) }, 0, 0);
-            _termStyle = new ComboBox { DropDownStyle = ComboBoxStyle.DropDownList, Width = 280 };
-            _termStyle.Items.AddRange(new object[] { "駭客終端（隨機綠字指令）", "仿真守護終端（StillGuard 擬真日誌）" });
-            _termStyle.SelectedIndexChanged += (s, e) => { Pull(); UpdatePreview(); };
-            termPanel.Controls.Add(_termStyle, 1, 0);
-            left.Controls.Add(termPanel);
-
-            _fakeUpdate = new CheckBox { Text = "偽 Windows 更新畫面（黑底旋轉圈，啟用時蓋過背景/時鐘/終端）", AutoSize = true, Margin = new Padding(3, 4, 3, 4) };
-            _fakeUpdate.CheckedChanged += (s, e) => { if (_fakeUpdateLang != null) _fakeUpdateLang.Enabled = _fakeUpdate.Checked; Pull(); UpdatePreview(); };
-            left.Controls.Add(_fakeUpdate);
-
-            var fuPanel = new TableLayoutPanel { ColumnCount = 2, AutoSize = true, Dock = DockStyle.Top };
-            fuPanel.Controls.Add(new Label { Text = "語言", AutoSize = true, Anchor = AnchorStyles.Left, Margin = new Padding(18, 7, 3, 3) }, 0, 0);
-            _fakeUpdateLang = new ComboBox { DropDownStyle = ComboBoxStyle.DropDownList, Width = 160 };
-            _fakeUpdateLang.Items.AddRange(new object[] { "中文", "English" });
-            _fakeUpdateLang.SelectedIndexChanged += (s, e) => { Pull(); UpdatePreview(); };
-            fuPanel.Controls.Add(_fakeUpdateLang, 1, 0);
-            left.Controls.Add(fuPanel);
-
-            left.Controls.Add(SectionLabel("變更主密碼"));
-            var pwPanel = new TableLayoutPanel { ColumnCount = 2, AutoSize = true, Dock = DockStyle.Top };
-            pwPanel.Controls.Add(new Label { Text = "新密碼", AutoSize = true, Anchor = AnchorStyles.Left, Margin = new Padding(3, 7, 3, 3) }, 0, 0);
-            _pw1 = new TextBox { Width = 200, UseSystemPasswordChar = true };
-            pwPanel.Controls.Add(_pw1, 1, 0);
-            pwPanel.Controls.Add(new Label { Text = "確認密碼", AutoSize = true, Anchor = AnchorStyles.Left, Margin = new Padding(3, 7, 3, 3) }, 0, 1);
-            _pw2 = new TextBox { Width = 200, UseSystemPasswordChar = true };
-            pwPanel.Controls.Add(_pw2, 1, 1);
+            var pw = NewGrid();
+            _pw1 = Pwd(220);
+            Row(pw, "新密碼", _pw1);
+            _pw2 = Pwd(220);
+            Row(pw, "確認密碼", _pw2);
             var pwBtn = new Button { Text = "套用新密碼", AutoSize = true };
             pwBtn.Click += ApplyPassword;
-            pwPanel.Controls.Add(pwBtn, 1, 2);
-            left.Controls.Add(pwPanel);
-            _pwStatus = new Label { AutoSize = true, ForeColor = Color.DimGray, Margin = new Padding(3, 4, 3, 8) };
-            left.Controls.Add(_pwStatus);
+            Full(pw, Wrap(pwBtn));
+            _pwStatus = new Label { AutoSize = true, ForeColor = Color.DimGray };
+            Full(pw, _pwStatus);
+            sec.Controls.Add(Group("變更主密碼", pw));
 
-            left.Controls.Add(SectionLabel("救援碼（可選 · 忘記主密碼時的後路）"));
-            var rsPanel = new TableLayoutPanel { ColumnCount = 2, AutoSize = true, Dock = DockStyle.Top };
-            rsPanel.Controls.Add(new Label { Text = "救援碼", AutoSize = true, Anchor = AnchorStyles.Left, Margin = new Padding(3, 7, 3, 3) }, 0, 0);
-            _rescue1 = new TextBox { Width = 200, UseSystemPasswordChar = true };
-            rsPanel.Controls.Add(_rescue1, 1, 0);
-            rsPanel.Controls.Add(new Label { Text = "確認救援碼", AutoSize = true, Anchor = AnchorStyles.Left, Margin = new Padding(3, 7, 3, 3) }, 0, 1);
-            _rescue2 = new TextBox { Width = 200, UseSystemPasswordChar = true };
-            rsPanel.Controls.Add(_rescue2, 1, 1);
+            var rs = NewGrid();
+            _rescue1 = Pwd(220);
+            Row(rs, "救援碼", _rescue1);
+            _rescue2 = Pwd(220);
+            Row(rs, "確認救援碼", _rescue2);
             var rsBtn = new Button { Text = "套用救援碼", AutoSize = true };
             rsBtn.Click += ApplyRescue;
-            rsPanel.Controls.Add(rsBtn, 1, 2);
             var rsClear = new Button { Text = "清除救援碼", AutoSize = true };
             rsClear.Click += ClearRescue;
-            rsPanel.Controls.Add(rsClear, 1, 3);
-            left.Controls.Add(rsPanel);
-            _rescueStatus = new Label { AutoSize = true, ForeColor = Color.DimGray, Margin = new Padding(3, 4, 3, 8) };
-            left.Controls.Add(_rescueStatus);
+            Full(rs, Wrap(rsBtn, rsClear));
+            _rescueStatus = new Label { AutoSize = true, ForeColor = Color.DimGray };
+            Full(rs, _rescueStatus);
+            sec.Controls.Add(Group("救援碼（可選 · 忘記主密碼時的後路）", rs));
 
-            // ── OTP 一次性救援碼（送至手機 / APP）──
-            left.Controls.Add(SectionLabel("OTP 一次性救援碼（送至手機 / APP）"));
-            _otpEnabled = new CheckBox { Text = "啟用 OTP 救援（鎖屏按 F2 寄送一次性碼）", AutoSize = true, Margin = new Padding(3, 4, 3, 4) };
-            left.Controls.Add(_otpEnabled);
-
-            var otpPanel = new TableLayoutPanel { ColumnCount = 2, AutoSize = true, Dock = DockStyle.Top };
-            otpPanel.Controls.Add(new Label { Text = "通道", AutoSize = true, Anchor = AnchorStyles.Left, Margin = new Padding(3, 7, 3, 3) }, 0, 0);
-            _otpChannel = new ComboBox { DropDownStyle = ComboBoxStyle.DropDownList, Width = 160 };
-            _otpChannel.Items.AddRange(new object[] { "telegram", "discord", "ntfy" });
+            // ---- 通知 / OTP ----
+            var ntf = TabHost(pgNotify);
+            var otp = NewGrid();
+            _otpEnabled = Check("啟用 OTP 救援（鎖屏按 F2 寄送一次性碼）");
+            Full(otp, _otpEnabled);
+            _otpChannel = Combo(160, new object[] { "telegram", "discord", "ntfy" });
             _otpChannel.SelectedIndexChanged += (s, e) => UpdateOtpFieldVisibility();
-            otpPanel.Controls.Add(_otpChannel, 1, 0);
-
-            otpPanel.Controls.Add(new Label { Text = "Telegram Token", AutoSize = true, Anchor = AnchorStyles.Left, Margin = new Padding(3, 7, 3, 3) }, 0, 1);
-            _tgToken = new TextBox { Width = 260, UseSystemPasswordChar = true };
-            otpPanel.Controls.Add(_tgToken, 1, 1);
-            otpPanel.Controls.Add(new Label { Text = "Telegram ChatId", AutoSize = true, Anchor = AnchorStyles.Left, Margin = new Padding(3, 7, 3, 3) }, 0, 2);
-            _tgChatId = new TextBox { Width = 260 };
-            otpPanel.Controls.Add(_tgChatId, 1, 2);
-
-            otpPanel.Controls.Add(new Label { Text = "Discord Webhook", AutoSize = true, Anchor = AnchorStyles.Left, Margin = new Padding(3, 7, 3, 3) }, 0, 3);
-            _dcWebhook = new TextBox { Width = 260, UseSystemPasswordChar = true };
-            otpPanel.Controls.Add(_dcWebhook, 1, 3);
-
-            otpPanel.Controls.Add(new Label { Text = "ntfy 伺服器", AutoSize = true, Anchor = AnchorStyles.Left, Margin = new Padding(3, 7, 3, 3) }, 0, 4);
-            _ntfyServer = new TextBox { Width = 260 };
-            otpPanel.Controls.Add(_ntfyServer, 1, 4);
-            otpPanel.Controls.Add(new Label { Text = "ntfy 主題", AutoSize = true, Anchor = AnchorStyles.Left, Margin = new Padding(3, 7, 3, 3) }, 0, 5);
-            _ntfyTopic = new TextBox { Width = 260 };
-            otpPanel.Controls.Add(_ntfyTopic, 1, 5);
-
-            var otpBtns = new FlowLayoutPanel { AutoSize = true };
+            Row(otp, "通道", _otpChannel);
+            _tgToken = Pwd(280);
+            Row(otp, "Telegram Token", _tgToken);
+            _tgChatId = new TextBox { Width = 280 };
+            Row(otp, "Telegram ChatId", _tgChatId);
+            _dcWebhook = Pwd(280);
+            Row(otp, "Discord Webhook", _dcWebhook);
+            _ntfyServer = new TextBox { Width = 280 };
+            Row(otp, "ntfy 伺服器", _ntfyServer);
+            _ntfyTopic = new TextBox { Width = 280 };
+            Row(otp, "ntfy 主題", _ntfyTopic);
             var otpApply = new Button { Text = "套用 OTP 設定", AutoSize = true };
             otpApply.Click += ApplyOtp;
             var otpTest = new Button { Text = "測試寄送", AutoSize = true };
             otpTest.Click += TestOtp;
-            otpBtns.Controls.Add(otpApply);
-            otpBtns.Controls.Add(otpTest);
-            otpPanel.Controls.Add(otpBtns, 1, 6);
-            left.Controls.Add(otpPanel);
+            Full(otp, Wrap(otpApply, otpTest));
+            _otpStatus = new Label { AutoSize = true, ForeColor = Color.DimGray, MaximumSize = new Size(440, 0) };
+            Full(otp, _otpStatus);
+            Full(otp, Hint("手機收到碼後，回覆「/unlock <碼>」即可遠端解鎖本機（雙重驗證）。"));
+            ntf.Controls.Add(Group("OTP 一次性救援碼（送至手機 / APP）", otp));
 
-            _otpStatus = new Label { AutoSize = true, ForeColor = Color.DimGray, Margin = new Padding(3, 4, 3, 8), MaximumSize = new Size(420, 0) };
-            left.Controls.Add(_otpStatus);
+            // ---- 關於 ----
+            var abt = TabHost(pgAbout);
+            var about = NewGrid();
+            Row(about, "版本", SmallLabel("v1.2.0"));
+            Row(about, "定位", SmallLabel("防隨手亂動（防君子），非防內行惡意破解。"));
+            Row(about, "後路", SmallLabel("救援碼 / F2 OTP / 手機遠端解鎖；最壞 Ctrl+Alt+Del 結束程式。"));
+            var link = new LinkLabel { Text = "github.com/Racious/StillGuard", AutoSize = true };
+            link.LinkClicked += (s, e) => { try { System.Diagnostics.Process.Start("https://github.com/Racious/StillGuard"); } catch { } };
+            Row(about, "專案", link);
+            abt.Controls.Add(Group("關於 StillGuard 靜守", about));
 
-            // 底部按鈕列
+            // ===== 底部按鈕列 =====
             var buttons = new FlowLayoutPanel { Dock = DockStyle.Bottom, FlowDirection = FlowDirection.RightToLeft, Height = 48, Padding = new Padding(8) };
             var lockBtn = new Button { Text = "🔒 立即鎖定", AutoSize = true, Height = 32, BackColor = Color.FromArgb(40, 90, 160), ForeColor = Color.White, FlatStyle = FlatStyle.Flat };
             lockBtn.Click += (s, e) => LockNow();
@@ -3598,6 +3579,90 @@ namespace StillGuard
             right.Controls.Add(previewBar);
         }
 
+        // ---- 版面建構小工具：分頁宿主、分組框、對齊欄列 ----
+        private static TableLayoutPanel TabHost(TabPage page)
+        {
+            var t = new TableLayoutPanel { Dock = DockStyle.Fill, ColumnCount = 1, Padding = new Padding(12), AutoScroll = true };
+            page.BackColor = SystemColors.Control;
+            page.Controls.Add(t);
+            return t;
+        }
+
+        private static GroupBox Group(string title, Control inner)
+        {
+            var g = new GroupBox
+            {
+                Text = title,
+                Dock = DockStyle.Top,
+                AutoSize = true,
+                AutoSizeMode = AutoSizeMode.GrowAndShrink,
+                Padding = new Padding(12, 6, 12, 12),
+                Margin = new Padding(0, 0, 0, 12),
+                Font = new Font("Segoe UI", 9.75f, FontStyle.Bold),
+                ForeColor = Color.FromArgb(40, 90, 160)
+            };
+            inner.Font = new Font("Segoe UI", 9f, FontStyle.Regular);   // 內容用一般字重 / 黑字
+            inner.ForeColor = Color.Black;
+            inner.Dock = DockStyle.Top;
+            g.Controls.Add(inner);
+            return g;
+        }
+
+        private static TableLayoutPanel NewGrid()
+        {
+            var t = new TableLayoutPanel { Dock = DockStyle.Top, AutoSize = true, AutoSizeMode = AutoSizeMode.GrowAndShrink, ColumnCount = 2 };
+            t.ColumnStyles.Add(new ColumnStyle(SizeType.AutoSize));
+            t.ColumnStyles.Add(new ColumnStyle(SizeType.AutoSize));
+            return t;
+        }
+
+        // 一列「標籤 + 控制項」（標籤右對齊，欄寬一致）
+        private static void Row(TableLayoutPanel t, string key, Control field)
+        {
+            int r = t.RowCount;
+            t.Controls.Add(new Label { Text = key, AutoSize = true, Anchor = AnchorStyles.Right, ForeColor = Color.DimGray, Margin = new Padding(3, 7, 8, 3) }, 0, r);
+            field.Anchor = AnchorStyles.Left;
+            field.Margin = new Padding(0, 4, 0, 4);
+            t.Controls.Add(field, 1, r);
+            t.RowCount = r + 1;
+        }
+
+        // 一列「標籤 + 多個並排控制項」
+        private static void RowWrap(TableLayoutPanel t, string key, params Control[] fields)
+        {
+            Row(t, key, Wrap(fields));
+        }
+
+        // 跨兩欄整列（checkbox / 提示 / 狀態 / 按鈕列用）
+        private static void Full(TableLayoutPanel t, Control c)
+        {
+            int r = t.RowCount;
+            c.Anchor = AnchorStyles.Left;
+            c.Margin = new Padding(0, 3, 0, 3);
+            t.Controls.Add(c, 0, r);
+            t.SetColumnSpan(c, 2);
+            t.RowCount = r + 1;
+        }
+
+        private static FlowLayoutPanel Wrap(params Control[] cs)
+        {
+            var f = new FlowLayoutPanel { AutoSize = true, AutoSizeMode = AutoSizeMode.GrowAndShrink, WrapContents = false, Margin = new Padding(0) };
+            foreach (var c in cs) { c.Margin = new Padding(0, 1, 8, 1); f.Controls.Add(c); }
+            return f;
+        }
+
+        private static ComboBox Combo(int w, object[] items)
+        {
+            var c = new ComboBox { DropDownStyle = ComboBoxStyle.DropDownList, Width = w };
+            c.Items.AddRange(items);
+            return c;
+        }
+        private static NumericUpDown Num(int min, int max, int w) { return new NumericUpDown { Minimum = min, Maximum = max, Width = w }; }
+        private static TextBox Pwd(int w) { return new TextBox { Width = w, UseSystemPasswordChar = true }; }
+        private static CheckBox Check(string t) { return new CheckBox { Text = t, AutoSize = true, Margin = new Padding(0, 4, 0, 4) }; }
+        private static Label Hint(string t) { return new Label { Text = t, AutoSize = true, ForeColor = Color.DimGray, MaximumSize = new Size(440, 0), Margin = new Padding(0, 4, 0, 2) }; }
+        private static Label SmallLabel(string t) { return new Label { Text = t, AutoSize = true, MaximumSize = new Size(380, 0) }; }
+
         // 隱藏視窗→擷取當下乾淨桌面→還原，讓預覽反映現況
         private void RecaptureDesktopForPreview()
         {
@@ -3608,18 +3673,6 @@ namespace StillGuard
             Show();
             WindowState = FormWindowState.Normal;
             Activate();
-        }
-
-        private static Label SectionLabel(string text)
-        {
-            return new Label
-            {
-                Text = text,
-                AutoSize = true,
-                Font = new Font("Segoe UI", 10f, FontStyle.Bold),
-                Margin = new Padding(0, 12, 0, 4),
-                ForeColor = Color.FromArgb(40, 90, 160)
-            };
         }
 
         // ---- 資料繫結 ----
@@ -3645,6 +3698,7 @@ namespace StillGuard
                 _fakeUpdate.Checked = _cfg.fakeUpdate;
                 _fakeUpdateLang.SelectedIndex = ((_cfg.fakeUpdateLang ?? "").Trim().ToLowerInvariant() == "en") ? 1 : 0;
                 _fakeUpdateLang.Enabled = _cfg.fakeUpdate;
+                _showPwPanel.Checked = _cfg.showPasswordPanel;
 
                 var o = _cfg.otp ?? new OtpConfig();
                 _otpEnabled.Checked = o.enabled;
@@ -3689,6 +3743,7 @@ namespace StillGuard
             _cfg.terminalStyle = _termStyle.SelectedIndex == 1 ? "guard" : "hacker";
             _cfg.fakeUpdate = _fakeUpdate.Checked;
             _cfg.fakeUpdateLang = _fakeUpdateLang.SelectedIndex == 1 ? "en" : "zh";
+            _cfg.showPasswordPanel = _showPwPanel.Checked;
         }
 
         private void UpdatePreview() { _preview.SetConfig(_cfg); }

@@ -8,6 +8,7 @@
   "terminalStyle": "hacker",
   "fakeUpdate": false,
   "fakeUpdateLang": "zh",
+  "showPasswordPanel": true,
   "otp": {
     "enabled": false,
     "channel": "telegram",
