@@ -4,6 +4,8 @@
   "idleTimeoutSec": 10,
   "hotkey": "Ctrl+Shift+L",
   "showClock": true,
+  "showTerminal": false,
+  "terminalStyle": "hacker",
   "otp": {
     "enabled": false,
     "channel": "telegram",

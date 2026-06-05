@@ -157,6 +157,8 @@ build.bat
 | `idleTimeoutSec` | 輸入態無操作多少秒退回閒置態 |
 | `hotkey` | 全域鎖定快捷鍵（留空＝停用）；建議用設定視窗的「變更…」錄製 |
 | `showClock` | 鎖屏是否顯示內建時鐘（字級隨螢幕自動縮放） |
+| `showTerminal` | 鎖屏是否疊加終端特效（純裝飾，不影響安全） |
+| `terminalStyle` | 終端風格：`hacker`（駭客：隨機綠字假指令）/ `guard`（仿真守護：貼合 StillGuard 功能的擬真日誌，具生命週期與遞增計數） |
 
 > `password`、`rescue`、`otp` 等敏感欄位由**設定視窗自動寫入**（雜湊 / DPAPI 加密），請勿手動編輯。
 

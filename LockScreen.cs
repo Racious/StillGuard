@@ -337,7 +337,8 @@ namespace StillGuard
         public int idleTimeoutSec = 10;
         public string hotkey = "Ctrl+Alt+L";      // 全域鎖定快捷鍵
         public bool showClock = true;             // 鎖屏是否顯示內建時鐘
-        public bool showTerminal = false;         // 鎖屏是否顯示駭客終端特效（純裝飾）
+        public bool showTerminal = false;         // 鎖屏是否顯示終端特效（純裝飾）
+        public string terminalStyle = "hacker";   // 終端風格：hacker（駭客）| guard（仿真守護）
         public List<WidgetConfig> widgets = new List<WidgetConfig>();
         public PasswordConfig password = null;   // 主密碼雜湊（由 UI 設定）
         public PasswordConfig rescue = null;     // 救援碼雜湊（可選，由 UI 設定）
@@ -377,6 +378,7 @@ namespace StillGuard
             cfg.hotkey = GetStr(root, "hotkey", cfg.hotkey);
             cfg.showClock = GetBool(root, "showClock", cfg.showClock);
             cfg.showTerminal = GetBool(root, "showTerminal", cfg.showTerminal);
+            cfg.terminalStyle = GetStr(root, "terminalStyle", cfg.terminalStyle);
 
             cfg.password = ReadPwd(root, "password");
             cfg.rescue = ReadPwd(root, "rescue");
@@ -442,7 +444,8 @@ namespace StillGuard
             if (otp != null) members.Add(OtpJson(otp));
 
             sb.AppendLine("  \"showClock\": " + (showClock ? "true" : "false") + ",");
-            sb.AppendLine("  \"showTerminal\": " + (showTerminal ? "true" : "false") + (members.Count > 0 ? "," : ""));
+            sb.AppendLine("  \"showTerminal\": " + (showTerminal ? "true" : "false") + ",");
+            sb.AppendLine("  \"terminalStyle\": " + JStr(terminalStyle) + (members.Count > 0 ? "," : ""));
             for (int i = 0; i < members.Count; i++)
                 sb.AppendLine("  " + members[i] + (i < members.Count - 1 ? "," : ""));
 
@@ -675,8 +678,32 @@ namespace StillGuard
         }
     }
 
+    // 鎖屏真實事件（供 Guard 終端做因果反應；駭客終端忽略之）
+    internal enum TermSignal { KeySuppressed, MouseSuppressed, PanelOpen, VerifyAttempt }
+
+    // 終端特效的共同介面：每種「鎖屏顯示畫面」都實作此方法，
+    // LockForm / PreviewPanel 依設定的 terminalStyle 挑選對應實作。
+    internal interface ITerminalEffect
+    {
+        void SetCols(int cols);                              // 依終端區寬度設定每行字數
+        void Step();                                         // 推進一影格
+        void Render(Graphics g, Rectangle area, float scale);// 繪製到指定區域
+        void Signal(TermSignal sig, string detail);          // 接收鎖屏真實事件
+    }
+
+    // 依設定的風格字串產生對應的終端特效實作。
+    internal static class TerminalFactory
+    {
+        public static ITerminalEffect Create(string style)
+        {
+            string s = (style ?? "").Trim().ToLowerInvariant();
+            if (s == "guard") return new GuardTerminal();
+            return new FakeTerminal();
+        }
+    }
+
     // 駭客終端特效：程式即時生成的綠字假指令，不停滾動（純裝飾，不影響安全）。
-    internal sealed class FakeTerminal
+    internal sealed class FakeTerminal : ITerminalEffect
     {
         // kind: 0 一般(暗綠) 1 成功(亮綠) 2 資訊(青) 3 警告(黃) 4 錯誤(紅) 5 進度
         private sealed class Line { public string Text; public int Kind; }
@@ -705,6 +732,9 @@ namespace StillGuard
 
         // 由外部依終端區寬度與字寬設定每行可容字元數
         public void SetCols(int cols) { if (cols > 24) _cols = cols; }
+
+        // 駭客終端為純自走式，不對真實事件反應。
+        public void Signal(TermSignal sig, string detail) { }
 
         public void Step()
         {
@@ -1683,6 +1713,483 @@ namespace StillGuard
     }
 
     // =========================================================================
+    //  仿真守護終端（Guard Mode）
+    //  以「劇情段（scenario）」為單位產生貼合 StillGuard 功能的擬真 log，
+    //  具生命週期（Boot → Guarding → InputShield → Unlock → OTP）與因果關係，
+    //  uptime / frameId / sector / 攔截計數等數值持續遞增。純裝飾，不影響安全。
+    //  敏感資訊一律遮蔽：密碼僅顯示 masked=true、OTP 顯示 OTP-XXXX、token 顯示 bot***。
+    // =========================================================================
+    internal sealed class GuardTerminal : ITerminalEffect
+    {
+        // Level：0 INFO  1 DATA  2 EVENT  3 WARN  4 TRACE  5 ERROR
+        private sealed class Line { public string Time; public int Level; public string Ns; public string Msg; }
+        private sealed class Pending { public int Level; public string Ns; public string Msg; }
+
+        private readonly List<Line> _lines = new List<Line>();
+        private readonly Queue<Pending> _queue = new Queue<Pending>();
+        private readonly Random _rng = new Random();
+
+        private int _frame;
+        private int _cols = 80;
+        private int _waitTicks;             // 逐行節奏：剩餘等待 tick（每 tick≈32ms）
+
+        // ── 連續遞增狀態（讓數值看起來像真的在累積）──
+        private readonly DateTime _base;    // 模擬時鐘基準
+        private double _simMs;              // 自基準起的模擬毫秒（每行隨機推進 80~280ms）
+        private double _bootDoneMs;         // 進入 GUARDING 的模擬時刻（算 uptime 用）
+        private bool _booted;
+        private int _sector = 1;
+        private int _frameId = 1;
+        private int _block = 1;
+        private int _suppressedKb;
+        private int _suppressedMs;
+        private int _capturedUnlock;
+        private int _attempts;
+
+        // 真實事件反應（鍵鼠與面板）
+        private readonly Queue<Pending> _priority = new Queue<Pending>();   // 事件行優先於常態劇情顯示
+        private bool _externallyDriven;     // 收到過真實事件 → 停用自走的輸入/解鎖劇情，改由事件驅動
+        private int _lastInjFrame = -100;   // 上次插入事件行的影格（節流，避免洗版）
+        private int _lastMouseFrame = -100; // 上次計入滑鼠移動的影格（節流）
+        private int _keysSinceCounter;      // 距上次輸出 input.counter 的擊鍵數
+
+        // 開機橫幅用的固定參數
+        private readonly int _pid;
+        private readonly int _scrW;
+        private readonly int _scrH;
+        private readonly string _sessionId;
+
+        public GuardTerminal()
+        {
+            _base = DateTime.Now;
+            _pid = _rng.Next(2000, 30000);
+            try { var b = Screen.PrimaryScreen.Bounds; _scrW = b.Width; _scrH = b.Height; }
+            catch { _scrW = 2560; _scrH = 1440; }
+            _sessionId = "SG-" + _base.ToString("yyyyMMdd-HHmmss");
+            EnqueueBoot();
+        }
+
+        public void SetCols(int cols) { if (cols > 24) _cols = cols; }
+
+        public void Step()
+        {
+            _frame++;
+            if (_waitTicks > 0) { _waitTicks--; return; }
+
+            Pending p = null;
+            if (_priority.Count > 0) p = _priority.Dequeue();    // 真實事件行優先顯示
+            else
+            {
+                if (_queue.Count == 0) ChooseScenario();
+                if (_queue.Count > 0) p = _queue.Dequeue();
+            }
+            if (p == null) return;
+
+            _lines.Add(new Line { Time = TimeStamp(), Level = p.Level, Ns = p.Ns, Msg = p.Msg });
+            while (_lines.Count > 140) _lines.RemoveAt(0);
+
+            _simMs += _rng.Next(80, 281);                 // 模擬時鐘推進
+            _waitTicks = _priority.Count > 0 ? 1 : _rng.Next(2, 9);   // 事件連發時加快，常態約 64~288ms 一行
+            if (_priority.Count == 0 && _rng.Next(9) == 0) _waitTicks = _rng.Next(15, 38);   // 偶爾停頓（讀取等待感）
+        }
+
+        // ── 真實事件反應（由 LockForm 在鍵鼠鉤子 / 面板狀態變化時呼叫）──
+        public void Signal(TermSignal sig, string detail)
+        {
+            _externallyDriven = true;
+            switch (sig)
+            {
+                case TermSignal.KeySuppressed:
+                    _suppressedKb++;
+                    if (CanInject()) { QF(2, "input.keyboard", "key=VK_" + Vk() + " action=SUPPRESSED source=physical"); _lastInjFrame = _frame; }
+                    if (++_keysSinceCounter >= 4) { _keysSinceCounter = 0; QF(0, "input.counter", "suppressedKeyboard=" + _suppressedKb + " suppressedMouse=" + _suppressedMs + " capturedUnlockInput=" + _capturedUnlock); }
+                    Prompt();
+                    break;
+
+                case TermSignal.MouseSuppressed:
+                    bool isMove = string.IsNullOrEmpty(detail) || detail == "move";
+                    if (isMove) { if (_frame - _lastMouseFrame < 3) return; _lastMouseFrame = _frame; }   // 移動節流，避免計數暴衝
+                    _suppressedMs++;
+                    if (CanInject())
+                    {
+                        if (isMove) QF(2, "input.mouse", "dx=" + _rng.Next(-40, 41) + " dy=" + _rng.Next(-40, 41) + " action=SUPPRESSED");
+                        else QF(2, "input.mouse", "button=" + detail + " action=SUPPRESSED");
+                        _lastInjFrame = _frame;
+                    }
+                    Prompt();
+                    break;
+
+                case TermSignal.PanelOpen:
+                    QF(0, "panel.unlock", "unlock panel requested trigger=" + (string.IsNullOrEmpty(detail) ? "keyboard" : detail));
+                    QF(0, "panel.unlock", "input focus moved to secure password field");
+                    Prompt();
+                    break;
+
+                case TermSignal.VerifyAttempt:
+                    _capturedUnlock++;
+                    int len; if (!int.TryParse(detail, out len) || len <= 0) len = _rng.Next(4, 13);
+                    QF(2, "input.keyboard", "key=ENTER action=CAPTURED target=unlock-panel");
+                    QF(0, "auth.session", "password buffer updated length=" + len + " masked=true");
+                    QF(0, "auth.verify", "verifying password challenge session=" + _sessionId.Substring(3));
+                    _attempts++;
+                    QF(3, "auth.verify", "unlock attempt failed reason=HASH_MISMATCH attempts=" + _attempts);
+                    QF(0, "auth.session", "password buffer cleared");
+                    Prompt();
+                    break;
+            }
+        }
+
+        private void QF(int level, string ns, string msg) { _priority.Enqueue(new Pending { Level = level, Ns = ns, Msg = msg }); }
+        private bool CanInject() { return _frame - _lastInjFrame >= 2; }   // 約 64ms 一行，避免洗版
+        private void Prompt() { _waitTicks = 0; }                          // 事件行盡快顯示
+
+        // ── 依目前生命週期挑選下一段劇情並排入佇列 ──
+        private void ChooseScenario()
+        {
+            if (!_booted) { _booted = true; _bootDoneMs = _simMs; EnqueueIdle(); return; }
+
+            // 已接上真實事件：輸入攔截 / 解鎖劇情改由實際鍵鼠與面板觸發，
+            // 自走劇情僅保留常態守護資訊與偶發 OTP，達成「平常守護、碰鍵鼠才湧出對應 log」的因果感。
+            if (_externallyDriven)
+            {
+                if (_rng.Next(100) < 2) { EnqueueOtp(); return; }   // OTP 維持自走（偶發）
+                int g = _rng.Next(100);
+                if (g < 45) EnqueueIdle();
+                else if (g < 72) EnqueuePipeline();
+                else if (g < 86) EnqueueDiag();
+                else if (g < 96) EnqueueCyber();
+                else EnqueueProgress();
+                return;
+            }
+
+            int r = _rng.Next(100);
+            if (r < 8) { EnqueueInputShield(); return; }       // 偵測到鍵鼠輸入
+            if (r < 12) { EnqueueUnlock(); return; }            // 解鎖面板開啟→驗證失敗
+            if (r < 14) { EnqueueOtp(); return; }               // F2 / OTP 救援
+
+            int w = _rng.Next(100);                             // GUARDING 常態權重（預覽用，無真實事件）
+            if (w < 40) EnqueueIdle();
+            else if (w < 65) EnqueuePipeline();
+            else if (w < 80) EnqueueDiag();
+            else if (w < 92) EnqueueCyber();
+            else EnqueueProgress();
+        }
+
+        private void Q(int level, string ns, string msg) { _queue.Enqueue(new Pending { Level = level, Ns = ns, Msg = msg }); }
+
+        // ── Boot：啟動與初始化 ──
+        private void EnqueueBoot()
+        {
+            Q(0, "boot.loader", "StillGuard runtime bootstrap started");
+            Q(0, "boot.env", "os=Windows " + OsVer() + " arch=x64 session=interactive");
+            Q(0, "boot.process", "process=StillGuard.exe pid=" + _pid + " integrity=Medium");
+            Q(0, "config.loader", "loading profile from ./stillguard.config.json");
+            Q(0, "config.loader", "profile loaded theme=terminal-guard blur=18 dim=0.42");
+            Q(0, "display.probe", "primaryMonitor=DISPLAY1 bounds=0,0," + _scrW + "," + _scrH + " scale=125%");
+            Q(0, "display.capture", "desktop frame captured width=" + _scrW + " height=" + _scrH + " format=BGRA32");
+            Q(0, "visual.pipeline", "stage=blur radius=18 status=READY");
+            Q(0, "visual.pipeline", "stage=dim opacity=0.42 status=READY");
+            Q(0, "visual.pipeline", "stage=terminal_overlay opacity=0.78 status=READY");
+            Q(0, "crypto.verifier", "password verifier initialized algorithm=PBKDF2-SHA256 iterations=100000");
+            Q(0, "crypto.random", "secure random provider=Windows-CNG status=READY");
+            Q(0, "notifier.router", "channels loaded telegram=ON discord=OFF ntfy=ON");
+            Q(0, "hook.keyboard", "low-level keyboard hook installed id=KBD-LL-" + Hex(2) + " mode=exclusive");
+            Q(0, "hook.mouse", "low-level mouse hook installed id=MSE-LL-" + Hex(2) + " mode=exclusive");
+            Q(0, "session.guard", "guard session created id=" + _sessionId);
+            Q(0, "session.guard", "lock state changed UNLOCKED -> GUARDING");
+            Q(0, "terminal.renderer", "terminal stream attached maxLines=120 tick=160ms");
+        }
+
+        // ── Idle：常駐監控心跳與資料處理 ──
+        private void EnqueueIdle()
+        {
+            Q(0, "monitor.heartbeat", "state=GUARDING uptime=" + Uptime() + " cpu=" + Cpu() + "% memory=" + Mem() + "MB");
+            int n = _rng.Next(2, 6);
+            for (int i = 0; i < n; i++)
+            {
+                switch (_rng.Next(5))
+                {
+                    case 0:
+                        Q(1, "workspace.scan", "scanning sector " + _sector.ToString("D4") + "/4096 target=" + Pick(ScanTargets));
+                        _sector++; if (_sector > 4096) _sector = 1;
+                        break;
+                    case 1:
+                        Q(1, "queue.worker", "processing queue=" + Pick(Queues) + " item=" + Pick(ItemPrefix) + "-" + _rng.Next(1000, 9999) + " status=RUNNING");
+                        break;
+                    case 2:
+                        Q(0, "visual.pipeline", "frame refreshed frameId=" + _frameId.ToString("D8") + " durationMs=" + _rng.Next(3, 18) + " checksum=" + Hex(4));
+                        _frameId++;
+                        break;
+                    case 3:
+                        Q(0, "pipeline.checksum", "block=" + _block.ToString("D8") + " hash=" + Hex(4) + " status=verified");
+                        _block++;
+                        break;
+                    default:
+                        Q(0, "input.counter", "suppressedKeyboard=" + _suppressedKb + " suppressedMouse=" + _suppressedMs + " capturedUnlockInput=" + _capturedUnlock);
+                        break;
+                }
+            }
+        }
+
+        // ── TerminalPipeline：視覺管線與佇列處理 ──
+        private void EnqueuePipeline()
+        {
+            int n = _rng.Next(2, 5);
+            for (int i = 0; i < n; i++)
+            {
+                switch (_rng.Next(4))
+                {
+                    case 0:
+                        Q(0, "visual.pipeline", "frame refreshed frameId=" + _frameId.ToString("D8") + " durationMs=" + _rng.Next(3, 18) + " checksum=" + Hex(4));
+                        _frameId++;
+                        break;
+                    case 1:
+                        Q(1, "queue.worker", "processing queue=" + Pick(Queues) + " item=" + Pick(ItemPrefix) + "-" + _rng.Next(1000, 9999) + " status=" + Pick(new[] { "RUNNING", "DONE", "QUEUED" }));
+                        break;
+                    case 2:
+                        Q(0, "pipeline.checksum", "block=" + _block.ToString("D8") + " hash=" + Hex(4) + " status=verified");
+                        _block++;
+                        break;
+                    default:
+                        Q(1, "workspace.scan", "scanning sector " + _sector.ToString("D4") + "/4096 target=" + Pick(ScanTargets));
+                        _sector++; if (_sector > 4096) _sector = 1;
+                        break;
+                }
+            }
+        }
+
+        // ── InputShield：偵測並攔截使用者鍵鼠輸入 ──
+        private void EnqueueInputShield()
+        {
+            int keys = _rng.Next(2, 6);
+            for (int i = 0; i < keys; i++) { Q(2, "input.keyboard", "key=VK_" + Vk() + " action=SUPPRESSED source=physical"); _suppressedKb++; }
+            if (_rng.Next(2) == 0) { Q(2, "input.mouse", "dx=" + _rng.Next(-40, 41) + " dy=" + _rng.Next(-40, 41) + " action=SUPPRESSED"); _suppressedMs++; }
+            if (_rng.Next(2) == 0) { Q(2, "input.mouse", "button=" + Pick(MouseBtns) + " action=SUPPRESSED"); _suppressedMs++; }
+            Q(0, "input.counter", "suppressedKeyboard=" + _suppressedKb + " suppressedMouse=" + _suppressedMs + " capturedUnlockInput=" + _capturedUnlock);
+            if (_rng.Next(3) == 0)
+            {
+                Q(3, "shield.system", "secure attention sequence cannot be intercepted key=CTRL+ALT+DEL");
+                Q(0, "shield.system", "fallback policy=ALLOW_SYSTEM_RESERVED_KEYS");
+            }
+        }
+
+        // ── Unlock：解鎖面板開啟 → 驗證失敗 → 收起（不顯示真實密碼）──
+        private void EnqueueUnlock()
+        {
+            Q(0, "panel.unlock", "unlock panel requested trigger=" + Pick(Triggers));
+            Q(0, "panel.unlock", "input focus moved to secure password field");
+            Q(2, "input.keyboard", "key=ENTER action=CAPTURED target=unlock-panel");
+            _capturedUnlock++;
+            Q(0, "auth.session", "password buffer updated length=" + _rng.Next(4, 13) + " masked=true");
+            Q(0, "auth.verify", "verifying password challenge session=" + _sessionId.Substring(3));
+            _attempts++;
+            Q(3, "auth.verify", "unlock attempt failed reason=HASH_MISMATCH attempts=" + _attempts);
+            Q(0, "auth.session", "password buffer cleared");
+            Q(0, "panel.unlock", "unlock panel hidden reason=FAILED_ATTEMPT");
+        }
+
+        // ── OTP：F2 一次性救援碼流程（token / 碼皆遮蔽）──
+        private void EnqueueOtp()
+        {
+            Q(0, "rescue.otp", "rescue request received trigger=F2");
+            Q(0, "rescue.otp", "generating one-time unlock code ttl=300s digits=6");
+            Q(0, "crypto.random", "secure random source=Windows-CNG provider=BCryptGenRandom");
+            Q(0, "rescue.otp", "otp challenge created id=OTP-XXXX expiresAt=" + _base.AddMinutes(5).ToString("HH:mm:ss"));
+            Q(0, "notifier.router", "selected channel=telegram fallback=ntfy");
+            Q(0, "notifier.telegram", "POST https://api.telegram.org/bot***/sendMessage status=200 durationMs=" + _rng.Next(120, 900));
+            Q(0, "rescue.otp", "delivery status=SENT channel=telegram");
+            Q(0, "rescue.otp", "waiting for unlock code input");
+        }
+
+        // ── Diagnostics：健康檢查 ──
+        private void EnqueueDiag()
+        {
+            Q(0, "diag.health", "keyboardHook=OK mouseHook=OK notifier=READY renderer=READY");
+            Q(0, "monitor.heartbeat", "state=GUARDING uptime=" + Uptime() + " cpu=" + Cpu() + "% memory=" + Mem() + "MB");
+            if (_rng.Next(2) == 0) { Q(0, "pipeline.checksum", "block=" + _block.ToString("D8") + " hash=" + Hex(4) + " status=verified"); _block++; }
+        }
+
+        // ── TerminalPipeline / CyberWatch：裝飾性資料流 ──
+        private void EnqueueCyber()
+        {
+            int n = _rng.Next(2, 5);
+            for (int i = 0; i < n; i++) Q(4, "terminal.stream", "0x" + Hex(4) + "  " + HexBytes(_rng.Next(8, 17)));
+            if (_rng.Next(2) == 0) { Q(1, "workspace.scan", "scanning sector " + _sector.ToString("D4") + "/4096 target=" + Pick(ScanTargets)); _sector++; }
+        }
+
+        // ── Progress：進度條單行 ──
+        private void EnqueueProgress()
+        {
+            int p = Pick(new[] { 24, 38, 46, 57, 71, 88, 100 });
+            int filled = p / 5, total = 20;
+            string bar = new string('#', filled) + new string('-', total - filled);
+            Q(0, "terminal.progress", "[" + bar + "] " + p.ToString().PadLeft(3) + "% " + Pick(ProgressLabels));
+        }
+
+        // ── 文字 / 數值小工具 ──
+        private static readonly string[] ScanTargets = { "desktop-buffer", "input-shield", "visual-cache", "guard-surface", "overlay-frame" };
+        private static readonly string[] Queues = { "visual-refresh", "event-stream", "heartbeat", "checksum", "notifier" };
+        private static readonly string[] ItemPrefix = { "VR", "EV", "HB", "CK", "NT" };
+        private static readonly string[] MouseBtns = { "LEFT", "RIGHT", "MIDDLE" };
+        private static readonly string[] Triggers = { "keyboard", "mouse" };
+        private static readonly string[] ProgressLabels = { "stabilizing guard session", "validating input shield", "restoring guard surface", "guard session stabilized" };
+        private static readonly string[] OsBuilds = { "10.0.19045", "10.0.22631", "10.0.26100" };
+
+        private string OsVer() { return Pick(OsBuilds); }
+        private int Cpu2 { get { return _rng.Next(0, 9); } }
+        private string Cpu() { return _rng.Next(1, 6) + "." + Cpu2; }
+        private string Mem() { return _rng.Next(44, 92).ToString(); }
+        private string Vk()
+        {
+            int r = _rng.Next(30);
+            if (r < 26) return ((char)('A' + r)).ToString();
+            return Pick(new[] { "SHIFT", "SPACE", "TAB", "BACK", "RETURN" });
+        }
+        private string Pick(string[] a) { return a[_rng.Next(a.Length)]; }
+        private int Pick(int[] a) { return a[_rng.Next(a.Length)]; }
+        private string Hex(int bytes)
+        {
+            var sb = new StringBuilder(bytes * 2);
+            for (int i = 0; i < bytes; i++) sb.Append(_rng.Next(0, 256).ToString("x2"));
+            return sb.ToString();
+        }
+        private string HexBytes(int n)
+        {
+            var sb = new StringBuilder(n * 3);
+            for (int i = 0; i < n; i++) { if (i > 0) sb.Append(' '); sb.Append(_rng.Next(0, 256).ToString("X2")); }
+            return sb.ToString();
+        }
+        private string TimeStamp() { return "[" + _base.AddMilliseconds(_simMs).ToString("HH:mm:ss.fff") + "]"; }
+        private string Uptime()
+        {
+            int sec = (int)Math.Max(0, (_simMs - _bootDoneMs) / 1000.0);
+            return (sec / 3600).ToString("D2") + ":" + ((sec / 60) % 60).ToString("D2") + ":" + (sec % 60).ToString("D2");
+        }
+
+        // ── 顏色（依設計文件 terminal-guard 配色）──
+        private static Color LevelColor(int level)
+        {
+            switch (level)
+            {
+                case 1:  return Color.FromArgb(235, 154, 184, 255);  // DATA  藍
+                case 2:  return Color.FromArgb(238, 255, 188, 140);  // EVENT 橙
+                case 3:  return Color.FromArgb(238, 255, 211, 110);  // WARN  黃
+                case 4:  return Color.FromArgb(225, 182, 161, 255);  // TRACE 紫
+                case 5:  return Color.FromArgb(240, 255, 122, 122);  // ERROR 紅
+                default: return Color.FromArgb(238, 125, 255, 174);  // INFO  綠
+            }
+        }
+        private static readonly string[] LevelText = { "INFO ", "DATA ", "EVENT", "WARN ", "TRACE", "ERROR" };
+        private static readonly Color TimeColor = Color.FromArgb(200, 110, 150, 130);   // 時間戳 暗綠灰
+        private static readonly Color NsColor   = Color.FromArgb(225, 130, 195, 235);   // namespace 青
+        private static readonly Color MsgColor  = Color.FromArgb(235, 217, 247, 230);   // 一般訊息 淡綠白
+
+        private static GraphicsPath RoundedRect(Rectangle r, int rad)
+        {
+            var p = new GraphicsPath();
+            int d = rad * 2;
+            if (d <= 0 || d > r.Width || d > r.Height) { p.AddRectangle(r); return p; }
+            p.AddArc(r.Left, r.Top, d, d, 180, 90);
+            p.AddArc(r.Right - d, r.Top, d, d, 270, 90);
+            p.AddArc(r.Right - d, r.Bottom - d, d, d, 0, 90);
+            p.AddArc(r.Left, r.Bottom - d, d, d, 90, 90);
+            p.CloseFigure();
+            return p;
+        }
+        private static GraphicsPath RoundedRectTop(Rectangle r, int rad)
+        {
+            var p = new GraphicsPath();
+            int d = rad * 2;
+            p.AddArc(r.Left, r.Top, d, d, 180, 90);
+            p.AddArc(r.Right - d, r.Top, d, d, 270, 90);
+            p.AddLine(r.Right, r.Top + rad, r.Right, r.Bottom);
+            p.AddLine(r.Right, r.Bottom, r.Left, r.Bottom);
+            p.CloseFigure();
+            return p;
+        }
+        private static void DrawDot(Graphics g, int x, int y, int dia, Color c)
+        {
+            using (var b = new SolidBrush(c)) g.FillEllipse(b, x, y, dia, dia);
+        }
+
+        public void Render(Graphics g, Rectangle area, float scale)
+        {
+            int fontPx = Math.Max(14, (int)(16 * scale));
+            int lineH = (int)(fontPx * 1.3);
+            int pad = (int)(14 * scale);
+            int titleH = Math.Max(22, (int)(28 * scale));
+            int radius = Math.Max(6, (int)(10 * scale));
+
+            var prevSmooth = g.SmoothingMode;
+            g.SmoothingMode = SmoothingMode.AntiAlias;
+            using (var path = RoundedRect(area, radius))
+            using (var body = new SolidBrush(Color.FromArgb(220, 6, 18, 13)))      // 深綠終端底（半透）
+            using (var border = new Pen(Color.FromArgb(185, 60, 120, 95), Math.Max(1f, scale)))
+            {
+                g.FillPath(body, path);
+                g.DrawPath(border, path);
+            }
+            var titleRect = new Rectangle(area.Left, area.Top, area.Width, titleH);
+            using (var tpath = RoundedRectTop(titleRect, radius))
+            using (var tbg = new LinearGradientBrush(titleRect, Color.FromArgb(240, 28, 56, 46), Color.FromArgb(240, 16, 34, 28), LinearGradientMode.Vertical))
+                g.FillPath(tbg, tpath);
+
+            int dia = Math.Max(8, (int)(12 * scale));
+            int dy = area.Top + (titleH - dia) / 2;
+            int dx = area.Left + (int)(16 * scale);
+            int gap = dia + (int)(8 * scale);
+            DrawDot(g, dx, dy, dia, Color.FromArgb(255, 95, 86));
+            DrawDot(g, dx + gap, dy, dia, Color.FromArgb(255, 189, 46));
+            DrawDot(g, dx + gap * 2, dy, dia, Color.FromArgb(39, 201, 63));
+            g.SmoothingMode = prevSmooth;
+
+            var content = new Rectangle(area.Left, area.Top + titleH, area.Width, area.Height - titleH);
+            int vis = Math.Max(1, (content.Height - pad * 2) / lineH);
+            int start = Math.Max(0, _lines.Count - vis);
+
+            using (var tFont = new Font("Segoe UI Semibold", Math.Max(9f, 10f * scale), FontStyle.Regular, GraphicsUnit.Point))
+            using (var tBrush = new SolidBrush(Color.FromArgb(230, 200, 230, 212)))
+            using (var tFmt = new StringFormat { Alignment = StringAlignment.Center, LineAlignment = StringAlignment.Center })
+                g.DrawString("StillGuard — guard — " + _cols + "×" + vis, tFont, tBrush, new RectangleF(area.Left, area.Top, area.Width, titleH), tFmt);
+
+            var savedClip = g.Clip;
+            g.IntersectClip(content);
+            using (var font = new Font("Consolas", fontPx, FontStyle.Regular, GraphicsUnit.Pixel))
+            using (var fmt = new StringFormat(StringFormatFlags.NoWrap))
+            using (var bTime = new SolidBrush(TimeColor))
+            using (var bNs = new SolidBrush(NsColor))
+            using (var bMsg = new SolidBrush(MsgColor))
+            {
+                float cw = g.MeasureString("MMMMMMMMMM", font, int.MaxValue, fmt).Width / 10f;   // 等寬字元寬
+                float x0 = content.Left + pad;
+                int y = content.Top + pad;
+                for (int i = start; i < _lines.Count; i++)
+                {
+                    var ln = _lines[i];
+                    using (var bLvl = new SolidBrush(LevelColor(ln.Level)))
+                    {
+                        float x = x0;
+                        g.DrawString(ln.Time, font, bTime, x, y, fmt);
+                        x += cw * 15;                                  // 時間欄 [HH:MM:SS.fff]
+                        g.DrawString(LevelText[ln.Level % 6], font, bLvl, x, y, fmt);
+                        x += cw * 6;                                   // 等級欄
+                        g.DrawString((ln.Ns ?? "").PadRight(22), font, bNs, x, y, fmt);
+                        x += cw * 24;                                  // namespace 欄
+                        g.DrawString(ln.Msg ?? "", font, (ln.Level >= 2 ? bLvl : bMsg), x, y, fmt);
+                    }
+                    y += lineH;
+                }
+                if (_frame % 8 < 5)   // 閃爍游標（接在最後一行尾端）
+                {
+                    using (var bCur = new SolidBrush(LevelColor(0)))
+                        g.DrawString("_", font, bCur, x0, y, fmt);
+                }
+            }
+            g.Clip = savedClip;
+        }
+    }
+
+    // =========================================================================
     //  背景層（第 5 節）
     // =========================================================================
     internal static class BackgroundFactory
@@ -1884,8 +2391,8 @@ namespace StillGuard
         private string _lastMinute = "";
         private readonly System.Windows.Forms.Timer _tick = new System.Windows.Forms.Timer();
 
-        // 駭客終端特效
-        private readonly FakeTerminal _terminal = new FakeTerminal();
+        // 終端特效（依設定挑選風格：駭客 / 仿真守護）
+        private ITerminalEffect _terminal;
         private readonly System.Windows.Forms.Timer _animTimer = new System.Windows.Forms.Timer();
 
         // OTP 一次性救援碼
@@ -1910,6 +2417,7 @@ namespace StillGuard
         public LockForm(AppConfig cfg)
         {
             _cfg = cfg;
+            _terminal = TerminalFactory.Create(cfg.terminalStyle);
             _virtualScreen = SystemInformation.VirtualScreen;
 
             var pb = Screen.PrimaryScreen.Bounds;
@@ -2169,7 +2677,13 @@ namespace StillGuard
                 if (isDown)
                 {
                     // 任意鍵喚醒 → 切換至輸入態
+                    bool wasInput = (_state == UiState.Input);
                     WakeToInput();
+                    if (_cfg.showTerminal)
+                    {
+                        if (!wasInput) _terminal.Signal(TermSignal.PanelOpen, "keyboard");
+                        if (vk != 0x0D && vk != 0x71) _terminal.Signal(TermSignal.KeySuppressed, null);  // 略過 Enter / F2
+                    }
                     HandleKeyDown(vk, data.scanCode);
                     // 立即重繪密碼面板，讓輸入即時反映（不必等計時器，消除延遲感）
                     InvalidatePanel();
@@ -2216,6 +2730,7 @@ namespace StillGuard
                 }
                 else
                 {
+                    if (_cfg.showTerminal) _terminal.Signal(TermSignal.VerifyAttempt, _input.Length.ToString());
                     _input.Clear();
                     _showError = true;
                 }
@@ -2408,11 +2923,21 @@ namespace StillGuard
                     msg == NativeMethods.WM_MBUTTONDOWN || msg == NativeMethods.WM_MOUSEWHEEL)
                 {
                     _lastActivity = DateTime.Now;
-                    if (_state != UiState.Input)
+                    bool wasInput = (_state == UiState.Input);
+                    if (!wasInput)
                     {
                         // 滑鼠喚醒不清空輸入緩衝（其本就為空），但要切換狀態並重繪
                         _state = UiState.Input;
                         BeginInvoke((MethodInvoker)Invalidate);
+                    }
+                    if (_cfg.showTerminal)
+                    {
+                        string md = msg == NativeMethods.WM_MOUSEMOVE ? "move"
+                                  : msg == NativeMethods.WM_LBUTTONDOWN ? "LEFT"
+                                  : msg == NativeMethods.WM_RBUTTONDOWN ? "RIGHT"
+                                  : msg == NativeMethods.WM_MBUTTONDOWN ? "MIDDLE" : "WHEEL";
+                        _terminal.Signal(TermSignal.MouseSuppressed, md);
+                        if (!wasInput) _terminal.Signal(TermSignal.PanelOpen, "mouse");
                     }
                 }
             }
@@ -2514,7 +3039,8 @@ namespace StillGuard
         private Bitmap _desktopThumb;        // 主螢幕截圖縮圖（原圖，未模糊）
         private readonly Rectangle _primary;
         private readonly System.Windows.Forms.Timer _clock = new System.Windows.Forms.Timer();
-        private readonly FakeTerminal _previewTerm = new FakeTerminal();
+        private ITerminalEffect _previewTerm;
+        private string _previewStyle;
 
         public PreviewPanel()
         {
@@ -2577,6 +3103,10 @@ namespace StillGuard
             // 駭客終端特效（疊在背景上、時鐘之下；預覽以 1 秒節奏緩慢滾動示意）
             if (_cfg.showTerminal)
             {
+                string style = string.IsNullOrEmpty(_cfg.terminalStyle) ? "hacker" : _cfg.terminalStyle;
+                if (_previewTerm == null || _previewStyle != style)
+                { _previewTerm = TerminalFactory.Create(style); _previewStyle = style; }
+
                 int mx = (int)(dw * 0.06), my = (int)(dh * 0.06);
                 var trect = new Rectangle(dx + mx, dy + my, dw - mx * 2, dh - my * 2);
                 float tsc = (float)((double)dh / _primary.Height);
@@ -2676,6 +3206,7 @@ namespace StillGuard
         private Button _browseImage;
         private CheckBox _showClock;
         private CheckBox _showTerminal;
+        private ComboBox _termStyle;
         private PreviewPanel _preview;
         private TextBox _pw1, _pw2;
         private TextBox _rescue1, _rescue2;
@@ -2787,9 +3318,17 @@ namespace StillGuard
             _showClock = new CheckBox { Text = "顯示時鐘（畫面中央，字級隨螢幕自動縮放）", AutoSize = true, Margin = new Padding(3, 4, 3, 4) };
             _showClock.CheckedChanged += (s, e) => { Pull(); UpdatePreview(); };
             left.Controls.Add(_showClock);
-            _showTerminal = new CheckBox { Text = "駭客終端特效（綠字假指令不停滾動，純裝飾）", AutoSize = true, Margin = new Padding(3, 4, 3, 4) };
-            _showTerminal.CheckedChanged += (s, e) => { Pull(); UpdatePreview(); };
+            _showTerminal = new CheckBox { Text = "顯示終端特效（鎖屏疊加滾動日誌，純裝飾）", AutoSize = true, Margin = new Padding(3, 4, 3, 4) };
+            _showTerminal.CheckedChanged += (s, e) => { if (_termStyle != null) _termStyle.Enabled = _showTerminal.Checked; Pull(); UpdatePreview(); };
             left.Controls.Add(_showTerminal);
+
+            var termPanel = new TableLayoutPanel { ColumnCount = 2, AutoSize = true, Dock = DockStyle.Top };
+            termPanel.Controls.Add(new Label { Text = "風格", AutoSize = true, Anchor = AnchorStyles.Left, Margin = new Padding(18, 7, 3, 3) }, 0, 0);
+            _termStyle = new ComboBox { DropDownStyle = ComboBoxStyle.DropDownList, Width = 280 };
+            _termStyle.Items.AddRange(new object[] { "駭客終端（隨機綠字指令）", "仿真守護終端（StillGuard 擬真日誌）" });
+            _termStyle.SelectedIndexChanged += (s, e) => { Pull(); UpdatePreview(); };
+            termPanel.Controls.Add(_termStyle, 1, 0);
+            left.Controls.Add(termPanel);
 
             left.Controls.Add(SectionLabel("變更主密碼"));
             var pwPanel = new TableLayoutPanel { ColumnCount = 2, AutoSize = true, Dock = DockStyle.Top };
@@ -2936,6 +3475,8 @@ namespace StillGuard
 
                 _showClock.Checked = _cfg.showClock;
                 _showTerminal.Checked = _cfg.showTerminal;
+                _termStyle.SelectedIndex = ((_cfg.terminalStyle ?? "").Trim().ToLowerInvariant() == "guard") ? 1 : 0;
+                _termStyle.Enabled = _cfg.showTerminal;
 
                 var o = _cfg.otp ?? new OtpConfig();
                 _otpEnabled.Checked = o.enabled;
@@ -2977,6 +3518,7 @@ namespace StillGuard
             if (!_hotkeyRecording) _cfg.hotkey = (_hotkeyBox.Text ?? "").Trim();
             _cfg.showClock = _showClock.Checked;
             _cfg.showTerminal = _showTerminal.Checked;
+            _cfg.terminalStyle = _termStyle.SelectedIndex == 1 ? "guard" : "hacker";
         }
 
         private void UpdatePreview() { _preview.SetConfig(_cfg); }
