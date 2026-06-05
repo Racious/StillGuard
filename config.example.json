@@ -6,6 +6,8 @@
   "showClock": true,
   "showTerminal": false,
   "terminalStyle": "hacker",
+  "fakeUpdate": false,
+  "fakeUpdateLang": "zh",
   "otp": {
     "enabled": false,
     "channel": "telegram",

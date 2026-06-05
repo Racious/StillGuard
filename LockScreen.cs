@@ -339,6 +339,8 @@ namespace StillGuard
         public bool showClock = true;             // 鎖屏是否顯示內建時鐘
         public bool showTerminal = false;         // 鎖屏是否顯示終端特效（純裝飾）
         public string terminalStyle = "hacker";   // 終端風格：hacker（駭客）| guard（仿真守護）
+        public bool fakeUpdate = false;            // 偽 Windows 更新畫面（障眼模式，蓋過其他顯示）
+        public string fakeUpdateLang = "zh";       // 偽更新畫面文字語言：zh（中文）| en（英文）
         public List<WidgetConfig> widgets = new List<WidgetConfig>();
         public PasswordConfig password = null;   // 主密碼雜湊（由 UI 設定）
         public PasswordConfig rescue = null;     // 救援碼雜湊（可選，由 UI 設定）
@@ -379,6 +381,8 @@ namespace StillGuard
             cfg.showClock = GetBool(root, "showClock", cfg.showClock);
             cfg.showTerminal = GetBool(root, "showTerminal", cfg.showTerminal);
             cfg.terminalStyle = GetStr(root, "terminalStyle", cfg.terminalStyle);
+            cfg.fakeUpdate = GetBool(root, "fakeUpdate", cfg.fakeUpdate);
+            cfg.fakeUpdateLang = GetStr(root, "fakeUpdateLang", cfg.fakeUpdateLang);
 
             cfg.password = ReadPwd(root, "password");
             cfg.rescue = ReadPwd(root, "rescue");
@@ -445,7 +449,9 @@ namespace StillGuard
 
             sb.AppendLine("  \"showClock\": " + (showClock ? "true" : "false") + ",");
             sb.AppendLine("  \"showTerminal\": " + (showTerminal ? "true" : "false") + ",");
-            sb.AppendLine("  \"terminalStyle\": " + JStr(terminalStyle) + (members.Count > 0 ? "," : ""));
+            sb.AppendLine("  \"terminalStyle\": " + JStr(terminalStyle) + ",");
+            sb.AppendLine("  \"fakeUpdate\": " + (fakeUpdate ? "true" : "false") + ",");
+            sb.AppendLine("  \"fakeUpdateLang\": " + JStr(fakeUpdateLang) + (members.Count > 0 ? "," : ""));
             for (int i = 0; i < members.Count; i++)
                 sb.AppendLine("  " + members[i] + (i < members.Count - 1 ? "," : ""));
 
@@ -2190,6 +2196,108 @@ namespace StillGuard
     }
 
     // =========================================================================
+    //  偽 Windows 更新畫面（障眼模式）
+    //  純黑底 + Windows 11 風格單圈旋轉弧 + 中文「正在處理更新…請勿關閉電腦」，
+    //  百分比緩慢爬升、偶爾卡住，營造系統更新中的錯覺。純裝飾，不影響安全。
+    // =========================================================================
+    internal sealed class WindowsUpdateScene
+    {
+        private readonly Random _rng = new Random();
+        private float _t;         // spinner 全域時間相位（0~1 循環）
+        private int _pct;         // 目前階段的已完成百分比
+        private int _stage;       // 更新階段索引（循環，永遠在忙，不會顯示成「完成」）
+        private int _wait;        // 距下次 +1% 的剩餘 tick（製造緩慢與卡頓）
+        public string Lang = "zh";   // 文字語言：zh（中文）| en（英文）
+
+        // 多階段標題（仿真實 Windows 更新：下載 → 處理 → 設定 → 即將完成，各階段各自 0~100%）
+        private static readonly string[] StagesZh = { "正在下載更新", "正在處理更新", "正在設定更新", "即將完成" };
+        private static readonly string[] StagesEn = { "Downloading updates", "Working on updates", "Configuring update for Windows", "Almost done" };
+
+        private const float CycleSec = 1.6f;   // 圓點繞行一圈的週期（秒）
+        private const int DotCount = 5;        // 追逐圓點數量（仿 Windows boot throbber）
+
+        // 由動畫計時器（約 32ms）驅動：spinner 圓點追逐，百分比慢爬偶爾停頓
+        public void Step()
+        {
+            _t += 0.032f / CycleSec;
+            if (_t >= 1f) _t -= 1f;
+
+            if (_wait > 0) { _wait--; return; }
+            if (_pct >= 100)
+            {
+                // 到 100% → 進入下一個更新階段（標題改變、百分比歸零），永遠在忙不會「完成」
+                _pct = 0;
+                _stage = (_stage + 1) % StagesZh.Length;
+                _wait = _rng.Next(60, 120);                       // 階段間短暫停頓
+                return;
+            }
+
+            _pct++;
+            _wait = _rng.Next(20, 55);                            // 每 1% 約 0.6~1.8 秒
+            if (_rng.Next(10) == 0) _wait += _rng.Next(40, 120);  // 偶爾卡住（像在等待）
+        }
+
+        // 平滑緩動（頭尾慢、中段快）→ 圓點繞行時聚散加速，貼近 Windows throbber 觀感
+        private static float EaseInOutCubic(float x)
+        {
+            if (x < 0.5f) return 4f * x * x * x;
+            float u = -2f * x + 2f;
+            return 1f - (u * u * u) / 2f;
+        }
+
+        // 在指定區域（通常為主螢幕）置中繪製整個假更新畫面
+        public void Render(Graphics g, Rectangle area, float scale)
+        {
+            int cx = area.Left + area.Width / 2;
+            int cy = area.Top + (int)(area.Height * 0.40);
+            int R = Math.Max(18, (int)(area.Height * 0.05));
+
+            var prevSmooth = g.SmoothingMode;
+            g.SmoothingMode = SmoothingMode.AntiAlias;
+
+            // 仿 Windows boot throbber：N 顆白點沿圓周追逐，靠緩動造成聚散加速感
+            float dotR = Math.Max(2f, R * 0.085f);
+            using (var dot = new SolidBrush(Color.FromArgb(245, 255, 255, 255)))
+            {
+                for (int i = 0; i < DotCount; i++)
+                {
+                    float lt = _t - i * 0.06f;          // 各點時間錯開 → 形成彗星狀群聚
+                    lt -= (float)Math.Floor(lt);        // 取小數，落在 0~1
+                    float e = EaseInOutCubic(lt);
+                    double ang = (-90.0 + 360.0 * e) * Math.PI / 180.0;   // 由正上方起算
+                    float px = cx + (float)(R * Math.Cos(ang));
+                    float py = cy + (float)(R * Math.Sin(ang));
+                    g.FillEllipse(dot, px - dotR, py - dotR, dotR * 2, dotR * 2);
+                }
+            }
+            g.SmoothingMode = prevSmooth;
+
+            float mainPx = Math.Max(16f, area.Height * 0.026f);
+            float subPx = Math.Max(12f, area.Height * 0.0175f);
+            int mainY = cy + R + (int)(area.Height * 0.05);
+
+            bool en = (Lang ?? "zh").Trim().ToLowerInvariant() == "en";
+            string family = en ? "Segoe UI" : "Microsoft JhengHei UI";
+            int st = _stage % StagesZh.Length;
+            string mainText = en ? (StagesEn[st] + "  " + _pct + "% complete")
+                                 : (StagesZh[st] + "  " + _pct + "% 完成");
+            string subText = en ? "Don't turn off your computer." : "請勿關閉電腦。";
+
+            using (var fMain = new Font(family, mainPx, FontStyle.Regular, GraphicsUnit.Pixel))
+            using (var fSub = new Font(family, subPx, FontStyle.Regular, GraphicsUnit.Pixel))
+            using (var wBrush = new SolidBrush(Color.FromArgb(245, 245, 245, 245)))
+            using (var sBrush = new SolidBrush(Color.FromArgb(210, 215, 215, 215)))
+            using (var fmt = new StringFormat { Alignment = StringAlignment.Center, LineAlignment = StringAlignment.Near })
+            {
+                var mainRect = new RectangleF(area.Left, mainY, area.Width, mainPx * 1.6f);
+                g.DrawString(mainText, fMain, wBrush, mainRect, fmt);
+                var subRect = new RectangleF(area.Left, mainY + mainPx * 1.9f, area.Width, subPx * 1.6f);
+                g.DrawString(subText, fSub, sBrush, subRect, fmt);
+            }
+        }
+    }
+
+    // =========================================================================
     //  背景層（第 5 節）
     // =========================================================================
     internal static class BackgroundFactory
@@ -2393,6 +2501,7 @@ namespace StillGuard
 
         // 終端特效（依設定挑選風格：駭客 / 仿真守護）
         private ITerminalEffect _terminal;
+        private readonly WindowsUpdateScene _update = new WindowsUpdateScene();   // 偽 Windows 更新畫面
         private readonly System.Windows.Forms.Timer _animTimer = new System.Windows.Forms.Timer();
 
         // OTP 一次性救援碼
@@ -2456,7 +2565,7 @@ namespace StillGuard
             _tick.Start();
             StartTelegramListener();   // 啟動 Telegram 遠端解鎖輪詢（若已設定）
 
-            // 駭客終端特效動畫
+            // 終端特效需先依寬度設定每行字數
             if (_cfg.showTerminal)
             {
                 float sc = PanelScale();
@@ -2464,6 +2573,11 @@ namespace StillGuard
                 int pad = (int)(14 * sc);
                 int cols = (int)((GetTerminalRect().Width - pad * 2) / (fontPx * 0.6));
                 _terminal.SetCols(cols);
+            }
+            _update.Lang = _cfg.fakeUpdateLang;   // 套用偽更新畫面語言
+            // 終端特效或偽更新畫面任一啟用 → 啟動動畫計時器
+            if (_cfg.showTerminal || _cfg.fakeUpdate)
+            {
                 _animTimer.Interval = 32;
                 _animTimer.Tick += OnAnim;
                 _animTimer.Start();
@@ -2483,8 +2597,8 @@ namespace StillGuard
 
         private void OnAnim(object sender, EventArgs e)
         {
-            _terminal.Step();
-            Invalidate(GetTerminalRect());
+            if (_cfg.fakeUpdate) { _update.Step(); Invalidate(GetUpdateRect()); }
+            else { _terminal.Step(); Invalidate(GetTerminalRect()); }
         }
 
         private Rectangle GetTerminalRect()
@@ -2492,6 +2606,14 @@ namespace StillGuard
             var s = _primaryLocal;
             int mx = (int)(s.Width * 0.06), my = (int)(s.Height * 0.06);
             return new Rectangle(s.Left + mx, s.Top + my, s.Width - mx * 2, s.Height - my * 2);
+        }
+
+        // 偽更新畫面的重繪範圍：主螢幕中央（涵蓋 spinner 與文字）
+        private Rectangle GetUpdateRect()
+        {
+            var s = _primaryLocal;
+            int w = (int)(s.Width * 0.7), h = (int)(s.Height * 0.55);
+            return new Rectangle(s.Left + (s.Width - w) / 2, s.Top + (s.Height - h) / 2, w, h);
         }
 
         private void OnTick(object sender, EventArgs e)
@@ -2523,6 +2645,18 @@ namespace StillGuard
         {
             var g = e.Graphics;
             g.TextRenderingHint = TextRenderingHint.ClearTypeGridFit;
+
+            // 偽 Windows 更新畫面：純黑底接管整個畫面，蓋過背景 / 時鐘 / 終端 / 密碼面板。
+            // 刻意「不繪製」密碼面板與任何提示，維持障眼純淨；解鎖機制仍全程運作：
+            //   ‧ 直接盲打密碼按 Enter 即解鎖（輸入累積與驗證與繪製無關）
+            //   ‧ 按 F2 照常寄送 OTP 一次性碼到裝置
+            //   ‧ 手機 Telegram /unlock 遠端解鎖照常
+            if (_cfg.fakeUpdate)
+            {
+                g.Clear(Color.Black);
+                _update.Render(g, _primaryLocal, PanelScale());
+                return;
+            }
 
             if (_background != null) g.DrawImageUnscaled(_background, 0, 0);
             else g.Clear(Color.Black);
@@ -3039,8 +3173,10 @@ namespace StillGuard
         private Bitmap _desktopThumb;        // 主螢幕截圖縮圖（原圖，未模糊）
         private readonly Rectangle _primary;
         private readonly System.Windows.Forms.Timer _clock = new System.Windows.Forms.Timer();
+        private readonly System.Windows.Forms.Timer _fastClock = new System.Windows.Forms.Timer();
         private ITerminalEffect _previewTerm;
         private string _previewStyle;
+        private readonly WindowsUpdateScene _previewUpdate = new WindowsUpdateScene();
 
         public PreviewPanel()
         {
@@ -3051,6 +3187,10 @@ namespace StillGuard
             _clock.Interval = 1000;           // 讓預覽的時鐘也會跳秒（終端在此節奏緩慢示意）
             _clock.Tick += (s, e) => Invalidate();
             _clock.Start();
+            // 偽更新畫面的圓點需流暢旋轉：僅在該模式啟用時以 ~31fps 重繪（不重建背景，成本低）
+            _fastClock.Interval = 32;
+            _fastClock.Tick += (s, e) => { if (_cfg != null && _cfg.fakeUpdate) Invalidate(); };
+            _fastClock.Start();
         }
 
         public void SetConfig(AppConfig cfg) { _cfg = cfg; Invalidate(); }
@@ -3094,11 +3234,22 @@ namespace StillGuard
             int dx = area.Left + (area.Width - dw) / 2, dy = area.Top + (area.Height - dh) / 2;
             var dest = new Rectangle(dx, dy, dw, dh);
 
+            g.TextRenderingHint = TextRenderingHint.ClearTypeGridFit;
+
+            // 偽 Windows 更新畫面：純黑底接管預覽，蓋過背景 / 時鐘 / 終端
+            if (_cfg.fakeUpdate)
+            {
+                using (var black = new SolidBrush(Color.Black)) g.FillRectangle(black, dest);
+                float usc = (float)((double)dh / _primary.Height);
+                _previewUpdate.Lang = _cfg.fakeUpdateLang;
+                _previewUpdate.Step();
+                _previewUpdate.Render(g, dest, usc);
+                return;
+            }
+
             // 背景
             using (var bg = BuildPreviewBackground(dw, dh))
                 if (bg != null) g.DrawImage(bg, dest);
-
-            g.TextRenderingHint = TextRenderingHint.ClearTypeGridFit;
 
             // 駭客終端特效（疊在背景上、時鐘之下；預覽以 1 秒節奏緩慢滾動示意）
             if (_cfg.showTerminal)
@@ -3187,7 +3338,7 @@ namespace StillGuard
 
         protected override void Dispose(bool disposing)
         {
-            if (disposing) { _clock.Dispose(); if (_desktopThumb != null) _desktopThumb.Dispose(); }
+            if (disposing) { _clock.Dispose(); _fastClock.Dispose(); if (_desktopThumb != null) _desktopThumb.Dispose(); }
             base.Dispose(disposing);
         }
     }
@@ -3207,6 +3358,8 @@ namespace StillGuard
         private CheckBox _showClock;
         private CheckBox _showTerminal;
         private ComboBox _termStyle;
+        private CheckBox _fakeUpdate;
+        private ComboBox _fakeUpdateLang;
         private PreviewPanel _preview;
         private TextBox _pw1, _pw2;
         private TextBox _rescue1, _rescue2;
@@ -3329,6 +3482,18 @@ namespace StillGuard
             _termStyle.SelectedIndexChanged += (s, e) => { Pull(); UpdatePreview(); };
             termPanel.Controls.Add(_termStyle, 1, 0);
             left.Controls.Add(termPanel);
+
+            _fakeUpdate = new CheckBox { Text = "偽 Windows 更新畫面（黑底旋轉圈，啟用時蓋過背景/時鐘/終端）", AutoSize = true, Margin = new Padding(3, 4, 3, 4) };
+            _fakeUpdate.CheckedChanged += (s, e) => { if (_fakeUpdateLang != null) _fakeUpdateLang.Enabled = _fakeUpdate.Checked; Pull(); UpdatePreview(); };
+            left.Controls.Add(_fakeUpdate);
+
+            var fuPanel = new TableLayoutPanel { ColumnCount = 2, AutoSize = true, Dock = DockStyle.Top };
+            fuPanel.Controls.Add(new Label { Text = "語言", AutoSize = true, Anchor = AnchorStyles.Left, Margin = new Padding(18, 7, 3, 3) }, 0, 0);
+            _fakeUpdateLang = new ComboBox { DropDownStyle = ComboBoxStyle.DropDownList, Width = 160 };
+            _fakeUpdateLang.Items.AddRange(new object[] { "中文", "English" });
+            _fakeUpdateLang.SelectedIndexChanged += (s, e) => { Pull(); UpdatePreview(); };
+            fuPanel.Controls.Add(_fakeUpdateLang, 1, 0);
+            left.Controls.Add(fuPanel);
 
             left.Controls.Add(SectionLabel("變更主密碼"));
             var pwPanel = new TableLayoutPanel { ColumnCount = 2, AutoSize = true, Dock = DockStyle.Top };
@@ -3477,6 +3642,9 @@ namespace StillGuard
                 _showTerminal.Checked = _cfg.showTerminal;
                 _termStyle.SelectedIndex = ((_cfg.terminalStyle ?? "").Trim().ToLowerInvariant() == "guard") ? 1 : 0;
                 _termStyle.Enabled = _cfg.showTerminal;
+                _fakeUpdate.Checked = _cfg.fakeUpdate;
+                _fakeUpdateLang.SelectedIndex = ((_cfg.fakeUpdateLang ?? "").Trim().ToLowerInvariant() == "en") ? 1 : 0;
+                _fakeUpdateLang.Enabled = _cfg.fakeUpdate;
 
                 var o = _cfg.otp ?? new OtpConfig();
                 _otpEnabled.Checked = o.enabled;
@@ -3519,6 +3687,8 @@ namespace StillGuard
             _cfg.showClock = _showClock.Checked;
             _cfg.showTerminal = _showTerminal.Checked;
             _cfg.terminalStyle = _termStyle.SelectedIndex == 1 ? "guard" : "hacker";
+            _cfg.fakeUpdate = _fakeUpdate.Checked;
+            _cfg.fakeUpdateLang = _fakeUpdateLang.SelectedIndex == 1 ? "en" : "zh";
         }
 
         private void UpdatePreview() { _preview.SetConfig(_cfg); }
